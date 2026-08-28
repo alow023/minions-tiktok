@@ -501,7 +501,7 @@ class ShoppingCopilot(Agent):
             routes.append(self._bm25_route(
                 self._terms_from(last + st["cat"], 1.0), allowed, catset))
 
-        if not _flag("C_ROUTES"):
+        if not _flag("C_ROUTES", "0"):
             routes = routes[:1]
         pool: set[str] = set().union(*routes) if routes else set()
 
@@ -564,7 +564,15 @@ class ShoppingCopilot(Agent):
             session_id, {"cat": [], "turns": [], "asked": set(),
                          "profile": {}, "override_at": None}))
 
-        rescue_at = int(os.environ.get("C_RESCUE_TURN", "5"))
+        if turn > 1 and self._is_override(user_message):
+            st["override_at"] = turn
+            self._drop_stale_constraints(st, turn)
+            st["shown"] = set()
+            st["bad_values"] = Counter()
+            st["last_slate"] = []
+            st["asked"] = set()
+
+        rescue_at = int(os.environ.get("C_RESCUE_TURN", "4"))
         if turn < rescue_at:
             out = super().respond(session_id, user_message, turn, top_k)
             slate = [r["parent_asin"] for r in out["recommendations"]]
@@ -581,11 +589,6 @@ class ShoppingCopilot(Agent):
             for t, text in st["turns"]:
                 if t >= ov:
                     self._extract_constraints(st, text, t)
-
-        if turn > 1 and self._is_override(user_message):
-            st["override_at"] = turn
-            st["cat"] = []
-            self._drop_stale_constraints(st, turn)
 
         if not self._is_noninformative(user_message):
             st["turns"].append((turn, user_message))
