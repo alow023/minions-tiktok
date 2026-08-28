@@ -122,7 +122,6 @@ class Agent:
         self.blob: dict[str, str] = {}
         self.price: dict[str, float | None] = {}
         self.store: dict[str, str] = {}
-        # vocabularies learned from the catalog's own structured detail fields
         mat_counter: Counter = Counter()
         col_counter: Counter = Counter()
 
@@ -180,8 +179,6 @@ class Agent:
         self._attr_cache[asin] = d
         return d
 
-    # ---------- generic NLU ----------
-
     def _extract_category(self, msg: str) -> list[str]:
         m = LEAD_RE.search(msg)
         if m:
@@ -195,8 +192,6 @@ class Agent:
     def _is_noninformative(self, msg: str) -> bool:
         low = msg.lower()
         return any(c in low for c in NO_INFO_CUES)
-
-    # ---------- state ----------
 
     def reset(self, session_id, user_profile):
         self.state[session_id] = {"cat": [], "turns": [], "asked": set(),
@@ -217,8 +212,6 @@ class Agent:
             q[t] += 2.0
         return q
 
-    # ---------- question policy ----------
-
     def _ask_open(self):
         return "other", "Anything else that matters to you? Any detail helps me narrow this down."
 
@@ -234,7 +227,7 @@ class Agent:
             if len(groups) < 2:
                 continue
             h = -sum((v / total) * math.log(v / total) for v in groups.values() if v > 0)
-            h *= 1.0 - groups.get("<none>", 0.0) / total     # answerability weighting
+            h *= 1.0 - groups.get("<none>", 0.0) / total
             if h > best_h:
                 best, best_h = attr, h
         if best is None:
@@ -253,10 +246,7 @@ class Agent:
         h = -sum((v / total) * math.log(v / total) for v in groups.values() if v > 0)
         return (attr, msg) if h >= 1.0 else self._ask_open()
 
-    # ---------- confidence gate ----------
-
     def _gate_count(self, scores, turn: int) -> int:
-        """How many candidates are we willing to stand behind right now?"""
         if self.gate == "off" or not scores:
             return 10
         top = scores[0]
@@ -269,8 +259,6 @@ class Agent:
         if turn <= 4:
             return max(3, min(10, n))
         return 10
-
-    # ---------- main ----------
 
     def respond(self, session_id, user_message, turn, top_k):
         st = self.state.setdefault(session_id, {"cat": [], "turns": [], "asked": set(),
@@ -315,30 +303,6 @@ class Agent:
                 "usage": {"prompt_tokens": 0, "completion_tokens": 0}}
 
 
-# =============================================================================
-# ============================ PERSON C's PART ================================
-# =============================================================================
-# "Shopping Copilot" module — everything BELOW this banner was added by
-# Person C. Nothing above this banner has been modified: Person A and B's
-# code is byte-for-byte identical to their original file. This module plugs
-# in by SUBCLASSING their Agent class and reusing their helpers.
-#
-# Implements the remaining items from the team proposal:
-#   1. Extra catalog-mined vocabulary (style / fit / occasion) + a small
-#      expansion map so equivalent words widen (never replace) a filter.
-#   2. Constraint-driven hard filtering with automatic relaxation.
-#   3. Multi-route retrieval (3 query variants + rating prior) fused with
-#      Reciprocal Rank Fusion.
-#   4. Empirical-Bayes-shrunk rating quality prior.
-#   5. Refutation-driven slate rotation (never show the same product twice).
-#   6. Learning from rejection (penalise attribute values that keep
-#      appearing in rejected slates).
-#   7. Even-split question selection over the SURVIVING candidates.
-#   8. Override handling that also drops outdated hard constraints.
-#   9. Optional cross-encoder reranker behind a flag (safe no-op without it).
-# =============================================================================
-
-# --- budget parsing: plain-English price phrases -> a numeric price range ---
 _PRICE = r"\$?\s*(\d+(?:\.\d{1,2})?)"
 BUDGET_MAX_RE = re.compile(
     r"(?:under|below|less than|at most|no more than|max(?:imum)?(?: of)?|up to|cheaper than|within)\s+" + _PRICE, re.I)
@@ -347,9 +311,6 @@ BUDGET_MIN_RE = re.compile(
 BUDGET_BETWEEN_RE = re.compile(r"between\s+" + _PRICE + r"\s+(?:and|to|\-)\s+" + _PRICE, re.I)
 BUDGET_AROUND_RE = re.compile(r"(?:around|about|roughly|approximately|~)\s+" + _PRICE, re.I)
 
-# --- tiny everyday-English synonym map. Expansion only ever WIDENS a filter
-# (asking for "navy" also matches "blue") and always keeps the customer's own
-# word, so the correct product can never be expanded away. ---
 EXPAND = {
     "navy": {"blue"}, "gray": {"grey"}, "grey": {"gray"},
     "charcoal": {"gray", "grey"}, "burgundy": {"maroon", "red"},
@@ -360,10 +321,9 @@ EXPAND = {
     "woollen": {"wool"}, "wooden": {"wood"},
 }
 
-RRF_K = 60          # standard Reciprocal Rank Fusion constant
-MIN_KEEP = 25       # a hard filter must leave at least this many candidates,
-                    # otherwise it relaxes into a soft ranking boost
-SLATE_SIZE = 10     # the contract scores Top 10, so we always fill 10 slots
+RRF_K = 60
+MIN_KEEP = 25
+SLATE_SIZE = 10
 
 
 def _expand(term: str) -> set[str]:
@@ -371,22 +331,14 @@ def _expand(term: str) -> set[str]:
 
 
 def _flag(name: str, default: str = "1") -> bool:
-    """Ablation switches for the team's ablation phase, e.g. C_FILTER=0
-    disables hard filtering. Everything defaults to ON."""
     return os.environ.get(name, default) != "0"
 
 
 class ShoppingCopilot(Agent):
-    """Person C's module. Reuses A/B's index, NLU helpers and question
-    machinery; replaces the per-turn orchestration in respond()."""
-
     def __init__(self, catalog_path="data/catalog.jsonl", **kw):
-        super().__init__(catalog_path, **kw)   # A/B build their index untouched
-        # Person C's questioner defaults to the proposal's even-split policy;
-        # an explicit constructor arg or QPOLICY env var still overrides it.
+        super().__init__(catalog_path, **kw)
         self.c_qpolicy = kw.get("question_policy") or os.environ.get("QPOLICY") or "hybrid"
 
-        # ---- pass 2 over the catalog: ratings + extra vocabulary buckets ----
         style_c, fit_c, occ_c = Counter(), Counter(), Counter()
         self.rating: dict[str, tuple[float | None, int]] = {}
         with Path(catalog_path).open(encoding="utf-8") as fh:
@@ -413,7 +365,6 @@ class ShoppingCopilot(Agent):
         self.vocab["fit"] = {w for w, _ in fit_c.most_common(40)}
         self.vocab["occasion"] = {w for w, _ in occ_c.most_common(40)}
 
-        # ---- empirical Bayes shrinkage for the rating prior ----
         tot_w = sum(n for _, n in self.rating.values())
         tot_r = sum((r or 0) * n for r, n in self.rating.values())
         self.mu = (tot_r / tot_w) if tot_w else 4.0
@@ -423,7 +374,6 @@ class ShoppingCopilot(Agent):
         for a, (r, n) in self.rating.items():
             self.shrunk[a] = ((r or self.mu) * n + self.mu * self.m) / (n + self.m)
 
-        # ---- gazetteer inverted index: vocab term -> set of products ----
         gaz = set().union(*self.vocab.values())
         self.term_asins: dict[str, set[str]] = defaultdict(set)
         for a, blob in self.blob.items():
@@ -431,21 +381,17 @@ class ShoppingCopilot(Agent):
                 self.term_asins[t].add(a)
         self.all_asins = set(self.blob)
 
-    # ---------------- session state ----------------
-
     def _c_state(self, st):
-        st.setdefault("shown", set())        # every asin ever shown (refuted)
-        st.setdefault("last_slate", [])      # what we showed on the last turn
-        st.setdefault("constraints", [])     # [(turn, bucket, {values})]
-        st.setdefault("budget", None)        # (lo, hi, turn)
-        st.setdefault("bad_values", Counter())  # (attr, value) -> rejections
+        st.setdefault("shown", set())
+        st.setdefault("last_slate", [])
+        st.setdefault("constraints", [])
+        st.setdefault("budget", None)
+        st.setdefault("bad_values", Counter())
         return st
 
     def reset(self, session_id, user_profile):
         super().reset(session_id, user_profile)
         self._c_state(self.state[session_id])
-
-    # ---------------- constraint extraction ----------------
 
     def _extract_constraints(self, st, msg: str, turn: int):
         mtoks = set(toks(msg))
@@ -483,8 +429,6 @@ class ShoppingCopilot(Agent):
             out |= vals
         return out
 
-    # ---------------- hard filtering with relaxation ----------------
-
     def _allowed_set(self, st) -> tuple[set[str], list[set[str]]]:
         allowed = self.all_asins
         soft: list[set[str]] = []
@@ -501,9 +445,9 @@ class ShoppingCopilot(Agent):
             if not hit:
                 continue
             if len(allowed & hit) >= MIN_KEEP:
-                allowed = allowed & hit          # safe to filter hard
+                allowed = allowed & hit
             else:
-                soft.append(hit)                 # too strict -> boost instead
+                soft.append(hit)
         if st["budget"]:
             lo, hi, _ = st["budget"]
             hit = {a for a in allowed
@@ -511,8 +455,6 @@ class ShoppingCopilot(Agent):
             if len(hit) >= MIN_KEEP:
                 allowed = hit
         return allowed, soft
-
-    # ---------------- retrieval routes + fusion ----------------
 
     def _bm25_route(self, qterms, allowed, catset, limit=300,
                     return_scores=False):
@@ -524,7 +466,7 @@ class ShoppingCopilot(Agent):
                 continue
             if catset:
                 ov = len(catset & self.cat_tokens[a]) / len(catset)
-                s *= (1.0 + 1.2 * ov)            # A/B's category boost, reused
+                s *= (1.0 + 1.2 * ov)
             out.append((s, a))
         out.sort(key=lambda x: (-x[0], x[1]))
         if return_scores:
@@ -544,21 +486,16 @@ class ShoppingCopilot(Agent):
         catset = set(st["cat"])
         routes: list[list[str]] = []
 
-        # route 1: A/B's full-history query (their weighting, untouched).
-        # Its RAW scores are kept: A/B's confidence gate reads score ratios,
-        # which fusion would flatten.
         r1 = self._bm25_route(self._query(st), allowed, catset, limit=300,
                               return_scores=True)
         raw1 = dict((a, s) for a, s in r1)
         routes.append([a for a, _ in r1])
 
-        # route 2: constraints only
         stated = self._stated_values(st)
         if stated:
             q = self._terms_from(sorted(stated) + st["cat"], 1.0)
             routes.append(self._bm25_route(q, allowed, catset))
 
-        # route 3: latest informative turn, plus the category
         if st["turns"]:
             last = toks(st["turns"][-1][1])
             routes.append(self._bm25_route(
@@ -568,13 +505,11 @@ class ShoppingCopilot(Agent):
             routes = routes[:1]
         pool: set[str] = set().union(*routes) if routes else set()
 
-        # route 4: soft-constraint boost (buckets too strict to hard-filter)
         if soft and pool:
             scored = sorted(pool, key=lambda a: (-sum(a in s for s in soft),
                                                  -self.shrunk[a], a))
             routes.append(scored[:300])
 
-        # route 5: rating quality prior over the pooled candidates
         if pool:
             routes.append(sorted(pool, key=lambda a: (-self.shrunk[a], a))[:300])
 
@@ -584,7 +519,6 @@ class ShoppingCopilot(Agent):
             for rank, a in enumerate(route, start=1):
                 fused[a] += w / (RRF_K + rank)
 
-        # learning from rejection: gentle multiplicative penalty
         bad = st["bad_values"]
         if bad and _flag("C_PENALTY"):
             for a in list(fused):
@@ -594,11 +528,7 @@ class ShoppingCopilot(Agent):
                     fused[a] *= 0.93 ** min(flags, 3)
         return sorted(fused.items(), key=lambda x: (-x[1], x[0])), raw1
 
-    # ---------------- optional reranker (off by default) ----------------
-
     def _maybe_rerank(self, st, ranked):
-        """Cross-encoder rerank behind RERANKER=ce. Safe no-op if the library
-        or model is unavailable, so the agent runs with no network/deps."""
         if os.environ.get("RERANKER") != "ce" or len(ranked) < 2:
             return ranked
         try:
@@ -613,8 +543,6 @@ class ShoppingCopilot(Agent):
         scores = self._ce.predict([(query, self.blob[a][:512]) for a, _ in head])
         head = [ab for _, ab in sorted(zip([-s for s in scores], head))]
         return head + ranked[40:]
-
-    # ---------------- learning from rejection ----------------
 
     def _learn_from_rejection(self, st):
         slate = st["last_slate"]
@@ -631,20 +559,11 @@ class ShoppingCopilot(Agent):
             if c >= max(2, int(0.6 * len(slate))):
                 st["bad_values"][(attr, val)] += 1
 
-    # ---------------- main per-turn orchestration ----------------
-
     def respond(self, session_id, user_message, turn, top_k):
         st = self._c_state(self.state.setdefault(
             session_id, {"cat": [], "turns": [], "asked": set(),
                          "profile": {}, "override_at": None}))
 
-        # Turns before the rescue point run Person A/B's code UNCHANGED, via
-        # super(); Person C only records what was shown. Testing showed the
-        # simulated customer's replies depend on the slate, so perturbing the
-        # early turns degrades the whole dialogue. C's machinery therefore
-        # takes over only once the base agent has stalled: from then on,
-        # re-showing the same slate is a guaranteed miss, so rotating in
-        # fresh, fused, constraint-aware candidates can only help.
         rescue_at = int(os.environ.get("C_RESCUE_TURN", "5"))
         if turn < rescue_at:
             out = super().respond(session_id, user_message, turn, top_k)
@@ -653,13 +572,9 @@ class ShoppingCopilot(Agent):
             st["shown"].update(slate)
             return out
 
-        # ---------------- rescue mode: Person C's pipeline ----------------
-        # the session continuing proves every slate so far was wrong
         self._learn_from_rejection(st)
         st["shown"].update(st["last_slate"])
 
-        # first rescue turn: rebuild constraints from the stored dialogue
-        # (turns are stored with their turn number, so overrides still apply)
         if not st.get("c_replayed"):
             st["c_replayed"] = True
             ov = st["override_at"] or 0
@@ -667,7 +582,6 @@ class ShoppingCopilot(Agent):
                 if t >= ov:
                     self._extract_constraints(st, text, t)
 
-        # override: drop, don't blend (A/B's detector + C's invalidation)
         if turn > 1 and self._is_override(user_message):
             st["override_at"] = turn
             st["cat"] = []
@@ -681,29 +595,24 @@ class ShoppingCopilot(Agent):
             if c:
                 st["cat"] = c
 
-        # constraints -> hard filter -> multi-route retrieval -> fusion
         allowed, soft = self._allowed_set(st)
         ranked, raw1 = self._fuse(st, allowed, soft)
         ranked = self._maybe_rerank(st, ranked)
 
-        # slate rotation: only candidates never shown before
         k = min(SLATE_SIZE, top_k or SLATE_SIZE)
         exclude = st["shown"] if _flag("C_ROTATE") else set()
         avail = [(a, s) for a, s in ranked if a not in exclude]
-        # A/B's confidence gate, fed the raw BM25 scores of the survivors:
-        # early turns show only what we would stand behind, which protects MRR
         gate_scores = sorted((raw1.get(a, 0.0) for a, _ in avail[:10]),
                              reverse=True)
         k = min(k, self._gate_count(gate_scores, turn))
         slate = [a for a, _ in avail][:k]
-        if len(slate) < k:                       # backfill so no slot is wasted
+        if len(slate) < k:
             for a in sorted(allowed - st["shown"] - set(slate),
                             key=lambda a: (-self.shrunk[a], a)):
                 slate.append(a)
                 if len(slate) == k:
                     break
 
-        # even-split question over the SURVIVORS (reuses A/B's machinery)
         cands = [(a, s) for a, s in ranked[:30] if a not in st["shown"]] \
             or [(a, 1.0) for a in slate]
         qp = self.c_qpolicy
@@ -722,7 +631,4 @@ class ShoppingCopilot(Agent):
                 "usage": {"prompt_tokens": 0, "completion_tokens": 0}}
 
 
-# The evaluator does `from starter.agent import Agent`, so pointing the name
-# `Agent` at Person C's subclass activates this module without touching any
-# of Person A/B's code above.
 Agent = ShoppingCopilot

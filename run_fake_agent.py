@@ -1,7 +1,9 @@
-"""Smoke-test the evaluator loop against fake_agent.Agent (empty DialogController stub).
+"""Smoke-test the evaluator loop against starter.agent.Agent.
 
-Verifies the reset/respond plumbing and turn loop work before any real
-retrieval/dialog logic is written. Does not import or modify starter.agent.
+Originally exercised a placeholder (starter/fake_agent.py, now removed);
+kept as a quick end-to-end sanity check that reset/respond/turn-looping
+still works against the real agent. For an actual scored run with the
+baseline-comparison table, use run_eval.py instead.
 
 Run: python3 run_fake_agent.py
 """
@@ -9,7 +11,7 @@ Run: python3 run_fake_agent.py
 from __future__ import annotations
 
 from evaluator.local_evaluator import catalog_index, evaluate, load_jsonl
-from starter.fake_agent import Agent
+from starter.agent import Agent
 
 CATALOG_PATH = "data/catalog.jsonl"
 DATASET_PATH = "data/public_set.jsonl"

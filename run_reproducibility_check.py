@@ -1,7 +1,14 @@
-"""Runs the full 200-session public set through starter.fake_agent.Agent
-and dumps a deterministic, ordered per-session results file. Meant to be
-run twice (as two separate `python3` invocations, so any PYTHONHASHSEED-
+"""Runs the full 200-session public set through starter.agent.Agent and
+dumps a deterministic, ordered per-session results file. Meant to be run
+twice (as two separate `python3` invocations, so any PYTHONHASHSEED-
 dependent nondeterminism actually shows up) and diffed byte-for-byte.
+
+starter.agent.Agent builds several sets during indexing (self.vocab values,
+gaz = set().union(*self.vocab.values()), per-product term sets intersected
+with that gazetteer) and tracks per-session state as Counters/sets
+(bad_values, shown, asked) -- none of that is inherently guaranteed
+order-stable across process runs just because it "looks like a dict", so
+this is worth checking directly rather than assuming it's fine.
 
 Run: python3 run_reproducibility_check.py <output.json>
 """
@@ -20,7 +27,7 @@ from evaluator.local_evaluator import (
     load_jsonl,
     materialize_hidden_fields,
 )
-from starter.fake_agent import Agent
+from starter.agent import Agent
 
 CATALOG_PATH = "data/catalog.jsonl"
 DATASET_PATH = "data/public_set.jsonl"
@@ -57,25 +64,19 @@ def main() -> None:
         for turn in range(1, MAX_TURNS + 1):
             response = agent.respond(session_id, user_message, turn, TOP_K)
             ranked = [r["parent_asin"] for r in response["recommendations"]]
-            state = agent.controller.state(session_id)
 
-            # Full penalties dicts can hold tens of thousands of entries by
-            # later turns (see diagnose_run.py's findings), so dumping them
-            # whole is impractical for a byte-diff. A bounded, order-
-            # sensitive sample is enough to expose the exact bug this
-            # script exists to catch: state()'s key ORDER used to depend
-            # on a set union (PYTHONHASHSEED-randomized per process); the
-            # first N keys in dict order reveal that just as well as the
-            # full dict would, at a fraction of the size.
-            penalty_items = list(state["penalties"].items())
+            state = agent.state[session_id]
+            bad_values = sorted(
+                f"{attribute}:{value}={count}"
+                for (attribute, value), count in state["bad_values"].items()
+            )
+
             turns.append({
                 "turn": turn,
                 "ask_attribute": response["ask_attribute"],
                 "recommendations": ranked,
-                "penalty_count": len(penalty_items),
-                "penalty_key_order_sample": [pid for pid, _ in penalty_items[:20]],
-                "penalty_value_sample": [round(v, 6) for _, v in penalty_items[:20]],
-                "constraint_count": len(state["constraints"]),
+                "shown_count": len(state["shown"]),
+                "bad_values_sample": bad_values[:20],
             })
 
             if override_applied and target in ranked:

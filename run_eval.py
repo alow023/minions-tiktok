@@ -7,8 +7,7 @@ Does not modify evaluator/local_evaluator.py in any way -- only imports
 load_jsonl, catalog_index, and evaluate from it.
 
 Run:
-    python3 run_eval.py                       # this module's agent (fake)
-    python3 run_eval.py --agent starter        # the untouched baseline
+    python3 run_eval.py                       # starter/agent.py's Agent
     python3 run_eval.py --catalog ... --dataset ... --output ...
 """
 
@@ -26,9 +25,6 @@ BASELINE_RESULTS_PATH = "docs/baseline_results.json"
 def _load_agent_class(name: str):
     if name == "starter":
         from starter.agent import Agent
-        return Agent
-    if name == "fake":
-        from starter.fake_agent import Agent
         return Agent
     raise ValueError(f"unknown --agent {name!r}")
 
@@ -64,7 +60,7 @@ def _print_baseline_comparison(result: dict) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run baseline or fake agent through the local evaluator")
-    parser.add_argument("--agent", choices=["starter", "fake"], default="fake", help="which Agent to evaluate")
+    parser.add_argument("--agent", choices=["starter"], default="starter", help="which Agent to evaluate")
     parser.add_argument("--catalog", default="data/catalog.jsonl")
     parser.add_argument("--dataset", default="data/public_set.jsonl")
     parser.add_argument("--output", default="results.json")

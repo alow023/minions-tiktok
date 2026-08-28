@@ -1,9 +1,16 @@
-"""Runs the full 200-session public set through starter.fake_agent.Agent
-(real DialogController from src.dialog, ranked via starter.stub_ranker) and
-checks nine invariants on every single turn of every session. All
-violations are collected first; nothing is asserted until the whole run
-finishes, so a single failing run shows the complete picture instead of
-stopping at the first broken turn.
+"""Runs the full 200-session public set through starter.agent.Agent
+(the ShoppingCopilot design: a field-weighted BM25 base agent for the first
+few turns, then Person C's constraint-filtered multi-route pipeline once
+the base agent stalls) and checks invariants on every turn of every
+session. All violations are collected first; nothing is asserted until the
+whole run finishes, so a single failing run shows the complete picture
+instead of stopping at the first broken turn.
+
+Adapted from an earlier version that tested src.dialog.DialogController
+(via the now-removed starter/fake_agent.py). That agent's internal state
+(exhausted-attribute tracking, a 0.0-1.0 penalty scale) doesn't exist in
+this architecture, so those invariants were dropped rather than forced
+onto a different design; see the analogues used below.
 """
 
 from __future__ import annotations
@@ -21,30 +28,28 @@ from evaluator.local_evaluator import (
     load_jsonl,
     materialize_hidden_fields,
 )
-from starter.fake_agent import Agent
+from starter.agent import Agent
 
 CATALOG_PATH = "data/catalog.jsonl"
 DATASET_PATH = "data/public_set.jsonl"
 TOP_K = 10
-PENALTY_MAX = 0.6
 
-# The 7 buckets classify_constraint() can actually emit / choose_question()
-# tracks in 'asked' and 'exhausted'. 'other', 'brand', and 'category' are
-# deliberately excluded from the "never repeat" bookkeeping -- 'other' is
-# meant to repeat every turn by design, and 'brand'/'category' are covered
-# by their own dedicated invariant instead.
-ASKABLE_ATTRIBUTES = {"budget", "material", "color", "size", "style", "use_case", "feature"}
+# Attributes _ask_infogain()/_ask_hybrid() actually cycle through and track
+# in st["asked"] (see starter/agent.py's base Agent). 'other' is the
+# catch-all fallback and is expected to repeat every turn by design.
+ASKABLE_ATTRIBUTES = {"material", "color", "budget", "brand"}
+# classify_constraint() in the evaluator never emits 'brand' or 'category',
+# so a real constraint can never match either -- asking for them always
+# produces "I don't have an additional preference for X", wasting the turn.
 NEVER_DIRECTLY_ASKED = {"brand", "category"}
 
 INVARIANTS = [
-    "recommendations_count_is_10",
     "recommendation_entries_well_formed",
-    "ask_attribute_non_null_and_legal",
+    "recommendations_count_between_1_and_10",
+    "ask_attribute_legal_or_none",
     "ask_attribute_not_brand_or_category",
     "no_cross_slate_duplicate_id",
-    "no_repeated_attribute_within_epoch",
-    "no_exhausted_attribute_reasked",
-    "no_penalty_over_0.6",
+    "no_repeated_askable_attribute_within_session",
     "no_exception_raised",
 ]
 
@@ -75,21 +80,19 @@ def _run() -> tuple[dict[str, set[str]], list[str]]:
                 effective_sample, coarse_category(categories.get(target, [])), disclosed
             )
 
-            # product_id -> list of (turn, pre_override_flag)
-            slate_occurrences: dict[str, list[tuple[int, bool]]] = defaultdict(list)
-            # (attribute, override_epoch) pairs already asked
-            asked_in_epoch: set[tuple[str, int]] = set()
+            slate_turns: dict[str, list[int]] = defaultdict(list)
+            asked_askable: set[str] = set()
 
             for turn in range(1, MAX_TURNS + 1):
                 response = agent.respond(session_id, user_message, turn, TOP_K)
 
                 recs = response.get("recommendations")
                 ids_this_turn: list[str] = []
-                if not isinstance(recs, list) or len(recs) != TOP_K:
-                    violations["recommendations_count_is_10"].add(sample_id)
+                if not isinstance(recs, list) or not (1 <= len(recs) <= TOP_K):
+                    violations["recommendations_count_between_1_and_10"].add(sample_id)
                     details.append(
                         f"{sample_id} turn {turn}: recommendations count == "
-                        f"{len(recs) if isinstance(recs, list) else type(recs).__name__}, expected {TOP_K}"
+                        f"{len(recs) if isinstance(recs, list) else type(recs).__name__}"
                     )
                 for entry in recs or []:
                     parent_asin = entry.get("parent_asin") if isinstance(entry, dict) else None
@@ -100,48 +103,21 @@ def _run() -> tuple[dict[str, set[str]], list[str]]:
                     ids_this_turn.append(parent_asin)
 
                 attribute = response.get("ask_attribute")
-                if attribute is None or attribute not in ALLOWED_ATTRIBUTES:
-                    violations["ask_attribute_non_null_and_legal"].add(sample_id)
-                    details.append(f"{sample_id} turn {turn}: ask_attribute={attribute!r}")
+                if attribute is not None and attribute not in ALLOWED_ATTRIBUTES:
+                    violations["ask_attribute_legal_or_none"].add(sample_id)
+                    details.append(f"{sample_id} turn {turn}: illegal ask_attribute={attribute!r}")
                 if attribute in NEVER_DIRECTLY_ASKED:
                     violations["ask_attribute_not_brand_or_category"].add(sample_id)
                     details.append(f"{sample_id} turn {turn}: asked {attribute!r} directly")
 
-                # Internal controller state, read for whitebox invariant
-                # checks not exposed by DialogController.state()'s 4 keys.
-                internal = agent.controller.sessions.get(session_id, {})
-                override_fired_now = bool(internal.get("override_fired"))
-                session_scenario = internal.get("scenario")
-                exhausted_now = set(internal.get("exhausted") or set())
-                pre_override = (session_scenario == "intent_override") and not override_fired_now
-                epoch = int(override_fired_now)
-
                 for parent_asin in ids_this_turn:
-                    slate_occurrences[parent_asin].append((turn, pre_override))
+                    slate_turns[parent_asin].append(turn)
 
                 if attribute in ASKABLE_ATTRIBUTES:
-                    key = (attribute, epoch)
-                    if key in asked_in_epoch:
-                        violations["no_repeated_attribute_within_epoch"].add(sample_id)
-                        details.append(
-                            f"{sample_id} turn {turn}: attribute {attribute!r} asked again "
-                            f"within the same override epoch ({epoch})"
-                        )
-                    asked_in_epoch.add(key)
-
-                if attribute in exhausted_now:
-                    violations["no_exhausted_attribute_reasked"].add(sample_id)
-                    details.append(f"{sample_id} turn {turn}: asked already-exhausted attribute {attribute!r}")
-
-                penalties_now = agent.controller.state(session_id)["penalties"]
-                over_limit = {pid: val for pid, val in penalties_now.items() if val > PENALTY_MAX}
-                if over_limit:
-                    violations["no_penalty_over_0.6"].add(sample_id)
-                    worst = max(over_limit.values())
-                    details.append(
-                        f"{sample_id} turn {turn}: {len(over_limit)} product(s) with penalty > {PENALTY_MAX} "
-                        f"(worst={worst:.4f})"
-                    )
+                    if attribute in asked_askable:
+                        violations["no_repeated_askable_attribute_within_session"].add(sample_id)
+                        details.append(f"{sample_id} turn {turn}: attribute {attribute!r} asked again")
+                    asked_askable.add(attribute)
 
                 ranked = ids_this_turn
                 if override_applied and target in ranked:
@@ -161,16 +137,10 @@ def _run() -> tuple[dict[str, set[str]], list[str]]:
                         effective_sample, attribute, disclosed, boundary_used
                     )
 
-            for parent_asin, occurrences in slate_occurrences.items():
-                if len(occurrences) <= 1:
-                    continue
-                if any(not pre for _turn, pre in occurrences):
+            for parent_asin, turns in slate_turns.items():
+                if len(turns) > 1:
                     violations["no_cross_slate_duplicate_id"].add(sample_id)
-                    turns = [t for t, _ in occurrences]
-                    details.append(
-                        f"{sample_id}: product {parent_asin!r} shown in turns {turns} "
-                        f"(not all pre-override in an intent_override session)"
-                    )
+                    details.append(f"{sample_id}: product {parent_asin!r} shown in turns {turns}")
 
         except Exception as exc:  # noqa: BLE001 -- deliberately broad: this IS the invariant
             violations["no_exception_raised"].add(sample_id)
@@ -184,9 +154,9 @@ class FullRunInvariantsTest(unittest.TestCase):
         violations, details = _run()
 
         print("\nInvariant violation summary (sessions violating each, out of 200):")
-        print(f"  {'invariant':<38} {'sessions':>8}")
+        print(f"  {'invariant':<48} {'sessions':>8}")
         for name in INVARIANTS:
-            print(f"  {name:<38} {len(violations[name]):>8}")
+            print(f"  {name:<48} {len(violations[name]):>8}")
 
         if details:
             print(f"\n{len(details)} violation detail line(s) (showing up to 40):")
