@@ -254,11 +254,16 @@ class Agent:
             return 10
         band = max(0.55, 0.90 - 0.10 * (turn - 1))
         n = sum(1 for s in scores[:10] if s >= band * top)
+        caps = [int(x) for x in os.environ.get("G_CAPS", "1,1,10,10,10").split(",")]
+        cap = caps[min(turn, len(caps)) - 1]
         if turn <= 2:
-            return max(1, min(n, 2))
-        if turn <= 4:
-            return max(3, min(10, n))
-        return 10
+            default_floor = 1
+        elif turn <= 4:
+            default_floor = 3
+        else:
+            default_floor = 10
+        floor = min(cap, default_floor)
+        return max(floor, min(cap, n))
 
     def respond(self, session_id, user_message, turn, top_k):
         st = self.state.setdefault(session_id, {"cat": [], "turns": [], "asked": set(),
