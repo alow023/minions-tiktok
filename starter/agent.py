@@ -200,7 +200,7 @@ class Agent:
     def _query(self, st) -> dict[str, float]:
         q: dict[str, float] = defaultdict(float)
         for i, (turn_no, text) in enumerate(st["turns"]):
-            w = 0.15 if (st["override_at"] is not None and turn_no < st["override_at"]) else 1.0
+            w = float(os.environ.get("C_PREOVW", "0.5")) if (st["override_at"] is not None and turn_no < st["override_at"]) else 1.0
             w *= 1.0 + 0.25 * i
             tt = toks(text)
             for t in tt:
