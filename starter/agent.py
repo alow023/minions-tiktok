@@ -432,7 +432,8 @@ class ShoppingCopilot(Agent):
     def _allowed_set(self, st) -> tuple[set[str], list[set[str]]]:
         allowed = self.all_asins
         soft: list[set[str]] = []
-        if not _flag("C_FILTER"):
+        mode = os.environ.get("C_FILTER", "2")
+        if mode == "0":
             return allowed, soft
         by_bucket: dict[str, set[str]] = defaultdict(set)
         for _, bucket, vals in st["constraints"]:
@@ -444,7 +445,9 @@ class ShoppingCopilot(Agent):
                     hit |= self.term_asins.get(term, set())
             if not hit:
                 continue
-            if len(allowed & hit) >= MIN_KEEP:
+            if mode == "2":
+                soft.append(hit)
+            elif len(allowed & hit) >= MIN_KEEP:
                 allowed = allowed & hit
             else:
                 soft.append(hit)
@@ -452,7 +455,9 @@ class ShoppingCopilot(Agent):
             lo, hi, _ = st["budget"]
             hit = {a for a in allowed
                    if self.price[a] is None or lo <= self.price[a] <= hi}
-            if len(hit) >= MIN_KEEP:
+            if mode == "2":
+                soft.append(hit)
+            elif len(hit) >= MIN_KEEP:
                 allowed = hit
         return allowed, soft
 
@@ -505,7 +510,9 @@ class ShoppingCopilot(Agent):
             routes = routes[:1]
         pool: set[str] = set().union(*routes) if routes else set()
 
-        if soft and pool:
+        soft_mode = os.environ.get("C_FILTER", "2") == "2"
+
+        if soft and pool and not soft_mode:
             scored = sorted(pool, key=lambda a: (-sum(a in s for s in soft),
                                                  -self.shrunk[a], a))
             routes.append(scored[:300])
@@ -518,6 +525,14 @@ class ShoppingCopilot(Agent):
         for w, route in zip(weights, routes):
             for rank, a in enumerate(route, start=1):
                 fused[a] += w / (RRF_K + rank)
+
+        if soft_mode and soft:
+            boost = float(os.environ.get("C_SOFT_BOOST", "0.05"))
+            total = len(soft)
+            for a in list(fused):
+                matched = sum(1 for s in soft if a in s)
+                if matched:
+                    fused[a] += boost * (matched / total)
 
         bad = st["bad_values"]
         if bad and _flag("C_PENALTY"):
