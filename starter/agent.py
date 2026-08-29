@@ -218,7 +218,7 @@ class Agent:
     def _ask_infogain(self, st, cands):
         best, best_h = None, -1.0
         total = sum(w for _, w in cands) or 1.0
-        for attr in ("material", "color", "budget", "brand"):
+        for attr in ("material", "color", "budget", "feature", "style", "use_case", "size"):
             if attr in st["asked"]:
                 continue
             groups: dict[str, float] = defaultdict(float)
