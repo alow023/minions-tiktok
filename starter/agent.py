@@ -564,6 +564,39 @@ class ShoppingCopilot(Agent):
         head = [ab for _, ab in sorted(zip([-s for s in scores], head))]
         return head + ranked[40:]
 
+    def _state_score(self, st, asin: str) -> float:
+        score = 0.0
+        for t, _bucket, vals in st["constraints"]:
+            recency = 1.0 + 0.3 * (t - 1)
+            for v in vals:
+                for term in _expand(v):
+                    if asin in self.term_asins.get(term, ()):
+                        idf = self.bm25.idf.get(term, 0.0)
+                        score += recency * (idf if idf > 0 else 0.1)
+        bad = st["bad_values"]
+        if bad:
+            penalty = sum(bad.get((attr, val), 0)
+                          for attr, val in self._attrs(asin).items())
+            if penalty:
+                score -= 0.5 * penalty
+        return score
+
+    def _state_rerank(self, st, ranked, turn: int):
+        if not _flag("C_RERANK", "0") or turn < 3 or len(ranked) < 2:
+            return ranked
+        top10 = ranked[:10]
+        rest = ranked[10:]
+        top_score = top10[0][1]
+        if top_score <= 0:
+            return ranked
+        second_score = top10[1][1] if len(top10) > 1 else 0.0
+        margin = (top_score - second_score) / top_score
+        margin_thresh = float(os.environ.get("C_RERANK_MARGIN", "0.15"))
+        if margin >= margin_thresh:
+            return ranked
+        rescored = sorted(top10, key=lambda x: (-self._state_score(st, x[0]), -x[1]))
+        return rescored + rest
+
     def _learn_from_rejection(self, st):
         slate = st["last_slate"]
         if not slate:
@@ -621,6 +654,7 @@ class ShoppingCopilot(Agent):
         allowed, soft = self._allowed_set(st)
         ranked, raw1 = self._fuse(st, allowed, soft)
         ranked = self._maybe_rerank(st, ranked)
+        ranked = self._state_rerank(st, ranked, turn)
 
         k = min(SLATE_SIZE, top_k or SLATE_SIZE)
         exclude = st["shown"] if _flag("C_ROTATE") else set()
