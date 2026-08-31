@@ -268,9 +268,16 @@ class Agent:
     def respond(self, session_id, user_message, turn, top_k):
         st = self.state.setdefault(session_id, {"cat": [], "turns": [], "asked": set(),
                                                 "profile": {}, "override_at": None})
+        early_rotate = os.environ.get("C_ROTATE_EARLY", "1")
         if turn > 1 and self._is_override(user_message):
             st["override_at"] = turn
             st["cat"] = []
+            if early_rotate == "2":
+                # Redundant under ShoppingCopilot: its own respond() already
+                # resets st["shown"] on override before ever delegating here,
+                # regardless of turn. This only matters if the base Agent is
+                # ever used standalone, without that outer reset.
+                st["shown"] = set()
         if not self._is_noninformative(user_message):
             st["turns"].append((turn, user_message))
         if not st["cat"]:
@@ -288,7 +295,10 @@ class Agent:
                 s *= (1.0 + 1.2 * ov)
             ranked.append((s, asin))
         ranked.sort(key=lambda x: (-x[0], x[1]))
-        top = ranked[:50]
+
+        exclude = st.get("shown", set()) if early_rotate != "0" else set()
+        avail = [(s, a) for s, a in ranked if a not in exclude] or ranked
+        top = avail[:50]
 
         n = self._gate_count([s for s, _ in top[:10]], turn)
         recs = [a for _, a in top[:n]]
