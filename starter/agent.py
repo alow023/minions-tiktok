@@ -1,13 +1,8 @@
-"""
-Conversational shopping agent — no evaluator-derived knowledge.
+"""Conversational shopping agent.
 
-Design rule applied throughout: every string constant and every heuristic in
-this file must be justifiable from (a) the published Agent API contract,
-(b) the product catalog itself, or (c) general knowledge of how English
-shoppers write. Nothing is derived from reading the simulator's source.
-
-Attribute vocabularies are LEARNED FROM THE CATALOG at index time rather than
-hardcoded, so they contain no borrowed word lists.
+Attribute vocabularies are learned from the catalog at index time. At runtime,
+the agent reads no ground truth or simulator state and imports nothing from
+the evaluator.
 """
 from __future__ import annotations
 
