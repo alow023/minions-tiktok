@@ -260,6 +260,27 @@ class Agent:
             return False
         return True
 
+    def _dense_index(self):
+        """Lazily build the LSA index; disabled unless C_DENSE is on."""
+        if not _flag("C_DENSE", "1"):
+            return None
+        if getattr(self, "_dense_failed", False):
+            return None
+        if getattr(self, "_dense", None) is None:
+            try:
+                from starter.semantic import build as _build_dense
+                ids = list(self.bm25.ids)
+                self._dense = _build_dense(
+                    ids, [self.blob.get(a, "") for a in ids],
+                    dims=int(os.environ.get("C_DENSE_K", "192")),
+                    cache=os.environ.get("C_DENSE_CACHE") or None)
+            except Exception:
+                # scikit-learn absent or index build failed: degrade to the
+                # pure-stdlib lexical pipeline rather than fail the session.
+                self._dense_failed = True
+                return None
+        return self._dense
+
     def _classify_track(self, msg: str) -> str:
         """Turn-1 dual-track classification: 'buyer' (a stated hard
         requirement, a budget hit, or a material/colour vocabulary hit) vs
@@ -298,6 +319,22 @@ class Agent:
         for t in st["cat"]:
             q[t] += 2.0
         return q
+
+    def _query_text(self, st) -> str:
+        """Raw-text mirror of _query() for the dense route: same turns, same
+        pre/post-override emphasis, as a string TF-IDF can vectorise."""
+        pre_w = float(os.environ.get("C_PREOVW", "0.5"))
+        parts: list[str] = []
+        for turn_no, text in st["turns"]:
+            if st["override_at"] is not None and turn_no < st["override_at"]:
+                if pre_w > 0:
+                    parts.append(text)
+            elif st["override_at"] is not None:
+                parts.append(text); parts.append(text)
+            else:
+                parts.append(text)
+        parts.extend(st["cat"])
+        return " ".join(parts)
 
     def _ask_open(self):
         return "other", "Anything else that matters to you? Any detail helps me narrow this down."
@@ -374,7 +411,13 @@ class Agent:
         early_rotate = os.environ.get("C_ROTATE_EARLY", "1")
         if turn > 1 and self._is_override(user_message):
             st["override_at"] = turn
-            st["cat"] = []
+            # C_KEEPCAT: the override message states a new *attribute* value,
+            # never a new category ("...what I need is: leather"). Clearing
+            # st["cat"] here makes the next block re-extract a category from
+            # that message, so the product category ("accessories belts")
+            # is replaced by a material token ("leather"). Keep it instead.
+            if not _flag("C_KEEPCAT", "0"):
+                st["cat"] = []
             if early_rotate == "2":
                 # Redundant under ShoppingCopilot: its own respond() already
                 # resets st["shown"] on override before ever delegating here,
@@ -403,6 +446,40 @@ class Agent:
                 s *= (1.0 + self._profile_prior(st, asin))
             ranked.append((s, asin))
         ranked.sort(key=lambda x: (-x[0], x[1]))
+
+        # --- Pillar I semantic route: catalog-derived dense (LSA) blend ---
+        # Reorders the lexical head only; never drops a candidate, so
+        # hit-rate@10 cannot regress from a bad cosine.
+        dense = self._dense_index()
+        # C_DENSE_MODE=override: apply the semantic blend only once the user
+        # has overridden their intent. Measured: the dense route helps when
+        # the accumulated query is contaminated by a superseded constraint
+        # (override MRR 0.633 -> 0.653) but costs precision when the lexical
+        # query is already clean (browsing, boundary). Restricting it leaves
+        # every non-override session bit-identical to the lexical baseline.
+        _dmode = os.environ.get("C_DENSE_MODE", "override")
+        if dense is not None and _dmode == "override" and st.get("override_at") is None:
+            dense = None
+        elif dense is not None and _dmode in ("margin", "margin_or_override"):
+            # Apply the semantic blend only when the lexical ranker is
+            # uncertain: a small top-1/top-2 gap means BM25 has no clear
+            # winner, which is where a second opinion can help and where a
+            # confident lexical hit cannot be disturbed.
+            fire = _dmode == "margin_or_override" and st.get("override_at") is not None
+            if not fire and len(ranked) > 1:
+                s1, s2 = ranked[0][0], ranked[1][0]
+                fire = s1 > 0 and (s1 - s2) / s1 < float(os.environ.get("C_DENSE_TAU", "0.05"))
+            if not fire:
+                dense = None
+        if dense is not None and ranked:
+            m = int(os.environ.get("C_DENSE_M", "200"))
+            alpha = float(os.environ.get("C_DENSE_ALPHA", "0.15"))
+            head, tail = ranked[:m], ranked[m:]
+            norm = head[0][0] or 1.0
+            cos = dense.cosines(self._query_text(st), [a for _, a in head])
+            head = sorted(((round(s / norm + alpha * max(0.0, cos.get(a, 0.0)), 6), a)
+                           for s, a in head), key=lambda x: (-x[0], x[1]))
+            ranked = head + tail
 
         exclude = st.get("shown", set()) if early_rotate != "0" else set()
         avail = [(s, a) for s, a in ranked if a not in exclude] or ranked

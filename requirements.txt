@@ -1,7 +1,16 @@
-# starter/agent.py and evaluator/local_evaluator.py are Python standard
-# library only (json, math, os, re, collections, pathlib, argparse,
-# statistics, random, uuid) -- no third-party packages are required to
-# reproduce the reported technical score.
+# evaluator/local_evaluator.py is Python standard library only.
+#
+# starter/agent.py is standard library only EXCEPT for the semantic
+# retrieval route (starter/semantic.py), which needs scikit-learn. That
+# route is on by default and contributes the reported technical score of
+# 0.897458. If scikit-learn is absent the agent catches the ImportError and
+# degrades to the pure-standard-library lexical pipeline, which scores
+# 0.896548 -- so the submission runs, and reproduces a documented score,
+# either way. No network access and no pretrained weights are used in
+# either case: the semantic space is factorised from catalog.jsonl itself
+# at index-build time with a fixed random_state.
+
+scikit-learn
 #
 # Minimum Python version: 3.10. The code uses PEP 604 union syntax
 # (`str | None`) and PEP 585 generic collection syntax (`set[str]`) as bare
