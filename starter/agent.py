@@ -88,6 +88,19 @@ def toks(text: str) -> list[str]:
     return [t.lower() for t in TOKEN_RE.findall(text) if len(t) > 1 and t.lower() not in STOP]
 
 
+_COARSE_EXCLUDED = {"clothing", "clothing shoes & jewelry", "clothing, shoes & jewelry"}
+
+
+def coarse_category(values) -> str:
+    cleaned: list[str] = []
+    for value in (values or []):
+        for part in str(value).split(","):
+            part = part.strip()
+            if part and part.lower() not in _COARSE_EXCLUDED:
+                cleaned.append(part)
+    return " ".join(cleaned[-2:]) if cleaned else "clothing item"
+
+
 class BM25:
     """Field-weighted BM25 with unigrams + bigrams."""
 
@@ -142,6 +155,7 @@ class Agent:
         self.gate = gate or os.environ.get("GATE", "margin")
         self.bm25 = BM25()
         self.cat_tokens: dict[str, set[str]] = {}
+        self.coarse_cat: dict[str, str] = {}
         self.blob: dict[str, str] = {}
         self.blob_toks: dict[str, set[str]] = {}
         self.price: dict[str, float | None] = {}
@@ -179,6 +193,7 @@ class Agent:
             self.bm25.add(a, [(title, 3.0), (cats, 2.0), (feats, 1.5),
                               (det, 1.2), (store, 1.0), (desc, 0.8)], bigrams=self.bigrams)
             self.cat_tokens[a] = set(toks(cats + " " + title))
+            self.coarse_cat[a] = coarse_category(p.get("categories"))
             self.blob[a] = " ".join([title, feats, det, desc]).lower()
             self.blob_toks[a] = set(toks(self.blob[a]))
             for t in set(toks(cats)) | set(toks(title)):
@@ -244,6 +259,26 @@ class Agent:
         if any(self.cat_df.get(t, 0) >= self.cat_df_min for t in tt):
             return False
         return True
+
+    def _classify_track(self, msg: str) -> str:
+        """Turn-1 dual-track classification: 'buyer' (a stated hard
+        requirement, a budget hit, or a material/colour vocabulary hit) vs
+        'explorer' (no extractable hard constraint). A bare category mention
+        via a lead-in phrase -- "I'm looking for women's sandals" -- names
+        what the customer wants, not a requirement on it, so lead-in
+        presence alone does not make a session 'buyer'."""
+        mtoks = set(toks(msg))
+        any_constraint = any(
+            mtoks & self.vocab.get(bucket, set())
+            for bucket in ("material", "color", "style", "fit", "occasion")
+        )
+        budget_hit = bool(
+            BUDGET_BETWEEN_RE.search(msg) or BUDGET_MAX_RE.search(msg)
+            or BUDGET_MIN_RE.search(msg) or BUDGET_AROUND_RE.search(msg)
+        )
+        if any_constraint or budget_hit:
+            return "buyer"
+        return "explorer"
 
     def reset(self, session_id, user_profile):
         self.state[session_id] = {"cat": [], "turns": [], "asked": set(),
@@ -352,6 +387,8 @@ class Agent:
             c = self._extract_category(user_message)
             if c:
                 st["cat"] = c
+        if turn == 1:
+            st["track"] = self._classify_track(user_message)
 
         raw = self.bm25.score(self._query(st))
         catset = set(st["cat"])
@@ -371,22 +408,58 @@ class Agent:
         avail = [(s, a) for s, a in ranked if a not in exclude] or ranked
         top = avail[:50]
 
-        n = self._gate_count([s for s, _ in top[:10]], turn)
-        recs = [a for _, a in top[:n]]
-        cands = [(a, s) for s, a in top[:30]]
-
-        if self.question_policy == "infogain":
-            attr, msg = self._ask_infogain(st, cands)
-        elif self.question_policy == "hybrid":
-            attr, msg = self._ask_hybrid(st, cands)
-        elif self.question_policy == "none":
-            attr, msg = None, "Here are the closest matches I found."
+        explorer_turn = (turn <= 2 and _flag("C_TRACK", "0")
+                         and st.get("track") == "explorer")
+        if explorer_turn:
+            recs = self._diverse_slate([a for _, a in top], 3)
+            attr, msg = self._ask_category(recs)
         else:
-            attr, msg = self._ask_open()
+            n = self._gate_count([s for s, _ in top[:10]], turn)
+            recs = [a for _, a in top[:n]]
+            cands = [(a, s) for s, a in top[:30]]
+
+            if self.question_policy == "infogain":
+                attr, msg = self._ask_infogain(st, cands)
+            elif self.question_policy == "hybrid":
+                attr, msg = self._ask_hybrid(st, cands)
+            elif self.question_policy == "none":
+                attr, msg = None, "Here are the closest matches I found."
+            else:
+                attr, msg = self._ask_open()
 
         return {"message": msg, "ask_attribute": attr,
                 "recommendations": [{"parent_asin": a} for a in recs],
                 "usage": {"prompt_tokens": 0, "completion_tokens": 0}}
+
+    def _diverse_slate(self, ranked_asins: list[str], k: int) -> list[str]:
+        seen_cats: set[str] = set()
+        slate: list[str] = []
+        for a in ranked_asins:
+            c = self.coarse_cat.get(a, "")
+            if c in seen_cats:
+                continue
+            seen_cats.add(c)
+            slate.append(a)
+            if len(slate) == k:
+                break
+        if len(slate) < k:
+            for a in ranked_asins:
+                if a in slate:
+                    continue
+                slate.append(a)
+                if len(slate) == k:
+                    break
+        return slate
+
+    def _ask_category(self, asins: list[str]):
+        cats = []
+        for a in asins:
+            c = self.coarse_cat.get(a, "")
+            if c and c not in cats:
+                cats.append(c)
+        if not cats:
+            return self._ask_open()
+        return "category", "Which of these are you interested in: " + ", ".join(cats) + "?"
 
 
 _PRICE = r"\$?\s*(\d+(?:\.\d{1,2})?)"
