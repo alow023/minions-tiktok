@@ -1,0 +1,113 @@
+38a39,45
+>     # Wider generic English shopper openings (robustness to paraphrase).
+>     r"hoping to find", r"hunting for", r"been hunting for", r"help me (?:get|find)",
+>     r"in the market for", r"trying to track down", r"track down", r"after",
+>     r"interested in", r"i'?d like", r"i would like", r"can i get", r"get me",
+>     r"need to (?:buy|get|find)", r"want to (?:buy|get|find)", r"browsing (?:for)?",
+>     r"thinking (?:about|of)?", r"something (?:like|along the lines of)",
+>     r"anything (?:like|similar to)", r"recommend(?:ations? for)?", r"suggest",
+39a47,48
+> if os.environ.get("R_LEAD","1")=="0":
+>     LEAD_INS = LEAD_INS[:10]
+45c54,63
+<                  "rather than", "no wait", "correction")
+---
+>                  "rather than", "no wait", "correction",
+>                  # Wider generic English retraction / redirection markers.
+>                  "change of plan", "new plan", "different direction", "switch to",
+>                  "swap that", "make that", "let's go with", "lets go with",
+>                  "in fact", "really want", "really need", "what i really",
+>                  "revised", "update:", "ignore", "disregard", "drop that",
+>                  "on reflection", "come to think", "second thoughts",
+>                  "that's the one", "thats the one", "the real ")
+> if os.environ.get("R_OVR","1")=="0":
+>     OVERRIDE_CUES = OVERRIDE_CUES[:12]
+51c69,85
+<                 "not sure", "either is fine", "no additional")
+---
+>                 "not sure", "either is fine", "no additional",
+>                 # Wider generic English no-opinion / nothing-to-add markers.
+>                 "additional preference", "any preference", "particular preference",
+>                 "really doesn't matter", "really doesnt matter", "don't mind",
+>                 "dont mind", "no opinion", "your call", "your pick", "you pick",
+>                 "surprise me", "easy on", "not bothered", "doesn't bother",
+>                 "either way", "no idea", "nothing else", "nothing more",
+>                 "can't think of anything", "cant think of anything",
+>                 "that's all i've got", "thats all i've got", "nope", "no strong feelings")
+> if os.environ.get("R_NI","1")=="0":
+>     NO_INFO_CUES = NO_INFO_CUES[:16]
+> # Structural (vocabulary-free) no-opinion test: a reply that carries no content
+> # token other than the attribute word the agent just asked about is an answer
+> # with no information in it, however it is phrased.
+> NO_INFO_RE = re.compile(
+>     r"(?:do(?:es)?n'?t|no|not|never)\b[^.!?]{0,30}\b"
+>     r"(?:preference|opinion|mind|matter|care|idea|strong|fussed|picky|bother)", re.I)
+128a163
+>         cat_df: Counter = Counter()
+160a196,203
+>             cat_toks = set(toks(cats)) | set(toks(title))
+>             for t in cat_toks:
+>                 cat_df[t] += 1
+>         self.cat_df = dict(cat_df)
+>         # Threshold scales with catalog size: a token has to name a real product
+>         # category, not appear once by accident.
+>         self.cat_df_min = max(5, len(rows) // 2000)
+>         self._gaz = set().union(*self.vocab.values()) if self.vocab else set()
+185c228,239
+<             return toks(m.group(1))
+---
+>             got = toks(m.group(1))
+>             if got:
+>                 return got
+>         if _flag("C_ROBUST") and getattr(self, "cat_df", None):
+>             # No lead-in matched. Fall back to token overlap with the catalog's
+>             # own category vocabulary: keep only message tokens that actually
+>             # name product categories somewhere in the catalog.
+>             tt = toks(msg)
+>             catish = [t for t in tt if self.cat_df.get(t, 0) >= self.cat_df_min]
+>             if catish:
+>                 return catish[:8]
+>             return tt[:6]
+194c248,266
+<         return any(c in low for c in NO_INFO_CUES)
+---
+>         if any(c in low for c in NO_INFO_CUES):
+>             return True
+>         if not _flag("C_ROBUST"):
+>             return False
+>         if NO_INFO_RE.search(low):
+>             return True
+>         # Structural test: nothing in the reply names a catalog attribute value
+>         # or a catalog category, so there is nothing to retrieve on.
+>         gaz = getattr(self, "_gaz", None)
+>         if gaz is None:
+>             return False
+>         tt = set(toks(low))
+>         if not tt:
+>             return True
+>         if tt & gaz:
+>             return False
+>         if any(self.cat_df.get(t, 0) >= self.cat_df_min for t in tt):
+>             return False
+>         return True
+357a430,435
+>         # Additional attribute buckets mined from the catalog's own details keys.
+>         EXTRA_KEYS = {"closure": ("closure",), "department": ("department",),
+>                       "pattern": ("pattern",), "size": ("size",),
+>                       "sport": ("sport",), "shape": ("shape",),
+>                       "feature": ("special feature",), "age": ("age range",)}
+>         extra_c: dict[str, Counter] = {k: Counter() for k in EXTRA_KEYS}
+378a457,459
+>                         for bucket, needles in EXTRA_KEYS.items():
+>                             if any(nd in kl for nd in needles):
+>                                 extra_c[bucket].update(toks(str(val)))
+381a463,469
+>         if _flag("C_VOCAB", "0"):
+>             cap = int(os.environ.get("C_VOCAB_CAP", "80"))
+>             for bucket, counter in (("style", style_c), ("fit", fit_c),
+>                                     ("occasion", occ_c)):
+>                 self.vocab[bucket] = {w for w, _ in counter.most_common(cap)}
+>             for bucket, counter in extra_c.items():
+>                 self.vocab[bucket] = {w for w, _ in counter.most_common(cap)}
+392a481
+>         self._gaz = gaz

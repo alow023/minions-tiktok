@@ -20,7 +20,7 @@ from pathlib import Path
 
 TOKEN_RE = re.compile(r"[a-z0-9]+", re.I)
 
-# Standard English function words. Nothing task-specific, nothing borrowed.
+# Standard English function words.
 STOP = set("""
 a about above after again against all am an and any are aren't as at be because been before being
 below between both but by can cannot could couldn't did didn't do does doesn't doing don't down
@@ -32,23 +32,51 @@ they this those through to too under until up very was wasn't we were weren't wh
 while who whom why with won't would wouldn't you your yours yourself yourselves
 """.split())
 
-# Generic ways an English shopper opens a request. Not a simulator template.
+# Generic ways an English shopper opens a request.
 LEAD_INS = [
     r"looking for", r"i need", r"i want", r"searching for", r"shopping for",
     r"trying to find", r"i'?m after", r"show me", r"find me", r"do you have",
+    r"hoping to find", r"hunting for", r"been hunting for", r"help me (?:get|find)",
+    r"in the market for", r"trying to track down", r"track down", r"after",
+    r"interested in", r"i'?d like", r"i would like", r"can i get", r"get me",
+    r"need to (?:buy|get|find)", r"want to (?:buy|get|find)", r"browsing (?:for)?",
+    r"thinking (?:about|of)?", r"something (?:like|along the lines of)",
+    r"anything (?:like|similar to)", r"recommend(?:ations? for)?", r"suggest",
 ]
+if os.environ.get("R_LEAD", "1") == "0":
+    LEAD_INS = LEAD_INS[:10]
 LEAD_RE = re.compile(r"(?:" + "|".join(LEAD_INS) + r")\s+(.+?)(?:[,.;!?]|$)", re.I)
 
 # Generic English markers that a speaker is retracting a previous statement.
 OVERRIDE_CUES = ("actually", "instead", "on second thought", "changed my mind",
                  "scratch that", "never mind", "nevermind", "forget", "i'd rather",
-                 "rather than", "no wait", "correction")
+                 "rather than", "no wait", "correction",
+                 "change of plan", "new plan", "different direction", "switch to",
+                 "swap that", "make that", "let's go with", "lets go with",
+                 "in fact", "really want", "really need", "what i really",
+                 "revised", "update:", "ignore", "disregard", "drop that",
+                 "on reflection", "come to think", "second thoughts",
+                 "that's the one", "thats the one", "the real ")
+if os.environ.get("R_OVR", "1") == "0":
+    OVERRIDE_CUES = OVERRIDE_CUES[:12]
 
 # Generic English markers of a non-answer / no-opinion reply.
 NO_INFO_CUES = ("no preference", "don't have a preference", "dont have a preference",
                 "doesn't matter", "doesnt matter", "no strong", "not fussed", "not picky",
                 "up to you", "you decide", "your judgment", "your judgement", "whatever",
-                "not sure", "either is fine", "no additional")
+                "not sure", "either is fine", "no additional",
+                "additional preference", "any preference", "particular preference",
+                "really doesn't matter", "really doesnt matter", "don't mind",
+                "dont mind", "no opinion", "your call", "your pick", "you pick",
+                "surprise me", "easy on", "not bothered", "doesn't bother",
+                "either way", "no idea", "nothing else", "nothing more",
+                "can't think of anything", "cant think of anything",
+                "that's all i've got", "thats all i've got", "nope", "no strong feelings")
+if os.environ.get("R_NI", "1") == "0":
+    NO_INFO_CUES = NO_INFO_CUES[:16]
+NO_INFO_RE = re.compile(
+    r"(?:do(?:es)?n'?t|no|not|never)\b[^.!?]{0,30}\b"
+    r"(?:preference|opinion|mind|matter|care|idea|strong|fussed|picky|bother)", re.I)
 
 
 def flat_text(value) -> str:
@@ -125,6 +153,7 @@ class Agent:
         mat_counter: Counter = Counter()
         col_counter: Counter = Counter()
 
+        cat_df: Counter = Counter()
         rows = []
         with Path(catalog_path).open(encoding="utf-8") as fh:
             for line in fh:
@@ -155,9 +184,14 @@ class Agent:
                               (det, 1.2), (store, 1.0), (desc, 0.8)], bigrams=self.bigrams)
             self.cat_tokens[a] = set(toks(cats + " " + title))
             self.blob[a] = " ".join([title, feats, det, desc]).lower()
+            for t in set(toks(cats)) | set(toks(title)):
+                cat_df[t] += 1
             pr = p.get("price")
             self.price[a] = pr if isinstance(pr, (int, float)) else None
             self.store[a] = store.lower()[:30]
+        self.cat_df = dict(cat_df)
+        self.cat_df_min = max(5, len(rows) // 2000)
+        self._gaz = set().union(*self.vocab.values()) if self.vocab else set()
         self.bm25.finalize()
         self._attr_cache: dict[str, dict[str, str]] = {}
         self.state: dict[str, dict] = {}
@@ -182,7 +216,15 @@ class Agent:
     def _extract_category(self, msg: str) -> list[str]:
         m = LEAD_RE.search(msg)
         if m:
-            return toks(m.group(1))
+            got = toks(m.group(1))
+            if got:
+                return got
+        if _flag("C_ROBUST") and self.cat_df:
+            tt = toks(msg)
+            catish = [t for t in tt if self.cat_df.get(t, 0) >= self.cat_df_min]
+            if catish:
+                return catish[:8]
+            return tt[:6]
         return toks(msg)[:6]
 
     def _is_override(self, msg: str) -> bool:
@@ -191,7 +233,20 @@ class Agent:
 
     def _is_noninformative(self, msg: str) -> bool:
         low = msg.lower()
-        return any(c in low for c in NO_INFO_CUES)
+        if any(c in low for c in NO_INFO_CUES):
+            return True
+        if not _flag("C_ROBUST"):
+            return False
+        if NO_INFO_RE.search(low):
+            return True
+        tt = set(toks(low))
+        if not tt:
+            return True
+        if tt & self._gaz:
+            return False
+        if any(self.cat_df.get(t, 0) >= self.cat_df_min for t in tt):
+            return False
+        return True
 
     def reset(self, session_id, user_profile):
         self.state[session_id] = {"cat": [], "turns": [], "asked": set(),
@@ -355,6 +410,13 @@ class ShoppingCopilot(Agent):
         self.c_qpolicy = kw.get("question_policy") or os.environ.get("QPOLICY") or "hybrid"
 
         style_c, fit_c, occ_c = Counter(), Counter(), Counter()
+        extra_keys = {
+            "closure": ("closure",), "department": ("department",),
+            "pattern": ("pattern",), "size": ("size",),
+            "sport": ("sport",), "shape": ("shape",),
+            "feature": ("special feature",), "age": ("age range",),
+        }
+        extra_c: dict[str, Counter] = {key: Counter() for key in extra_keys}
         self.rating: dict[str, tuple[float | None, int]] = {}
         with Path(catalog_path).open(encoding="utf-8") as fh:
             for line in fh:
@@ -376,9 +438,20 @@ class ShoppingCopilot(Agent):
                             fit_c.update(toks(str(val)))
                         if "occasion" in kl or "season" in kl:
                             occ_c.update(toks(str(val)))
-        self.vocab["style"] = {w for w, _ in style_c.most_common(40)}
-        self.vocab["fit"] = {w for w, _ in fit_c.most_common(40)}
-        self.vocab["occasion"] = {w for w, _ in occ_c.most_common(40)}
+                        for bucket, needles in extra_keys.items():
+                            if any(needle in kl for needle in needles):
+                                extra_c[bucket].update(toks(str(val)))
+        if _flag("C_VOCAB", "0"):
+            cap = int(os.environ.get("C_VOCAB_CAP", "80"))
+            for bucket, counter in (("style", style_c), ("fit", fit_c),
+                                    ("occasion", occ_c)):
+                self.vocab[bucket] = {w for w, _ in counter.most_common(cap)}
+            for bucket, counter in extra_c.items():
+                self.vocab[bucket] = {w for w, _ in counter.most_common(cap)}
+        else:
+            self.vocab["style"] = {w for w, _ in style_c.most_common(40)}
+            self.vocab["fit"] = {w for w, _ in fit_c.most_common(40)}
+            self.vocab["occasion"] = {w for w, _ in occ_c.most_common(40)}
 
         tot_w = sum(n for _, n in self.rating.values())
         tot_r = sum((r or 0) * n for r, n in self.rating.values())
@@ -390,6 +463,7 @@ class ShoppingCopilot(Agent):
             self.shrunk[a] = ((r or self.mu) * n + self.mu * self.m) / (n + self.m)
 
         gaz = set().union(*self.vocab.values())
+        self._gaz = gaz
         self.term_asins: dict[str, set[str]] = defaultdict(set)
         for a, blob in self.blob.items():
             for t in set(toks(blob)) & gaz:
