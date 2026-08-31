@@ -1,13 +1,8 @@
-"""
-Conversational shopping agent — no evaluator-derived knowledge.
+"""Conversational shopping agent.
 
-Design rule applied throughout: every string constant and every heuristic in
-this file must be justifiable from (a) the published Agent API contract,
-(b) the product catalog itself, or (c) general knowledge of how English
-shoppers write. Nothing is derived from reading the simulator's source.
-
-Attribute vocabularies are LEARNED FROM THE CATALOG at index time rather than
-hardcoded, so they contain no borrowed word lists.
+Attribute vocabularies are learned from the catalog at index time. At runtime,
+the agent reads no ground truth or simulator state and imports nothing from
+the evaluator.
 """
 from __future__ import annotations
 
@@ -20,7 +15,7 @@ from pathlib import Path
 
 TOKEN_RE = re.compile(r"[a-z0-9]+", re.I)
 
-# Standard English function words. Nothing task-specific, nothing borrowed.
+# Standard English function words.
 STOP = set("""
 a about above after again against all am an and any are aren't as at be because been before being
 below between both but by can cannot could couldn't did didn't do does doesn't doing don't down
@@ -32,23 +27,51 @@ they this those through to too under until up very was wasn't we were weren't wh
 while who whom why with won't would wouldn't you your yours yourself yourselves
 """.split())
 
-# Generic ways an English shopper opens a request. Not a simulator template.
+# Generic ways an English shopper opens a request.
 LEAD_INS = [
     r"looking for", r"i need", r"i want", r"searching for", r"shopping for",
     r"trying to find", r"i'?m after", r"show me", r"find me", r"do you have",
+    r"hoping to find", r"hunting for", r"been hunting for", r"help me (?:get|find)",
+    r"in the market for", r"trying to track down", r"track down", r"after",
+    r"interested in", r"i'?d like", r"i would like", r"can i get", r"get me",
+    r"need to (?:buy|get|find)", r"want to (?:buy|get|find)", r"browsing (?:for)?",
+    r"thinking (?:about|of)?", r"something (?:like|along the lines of)",
+    r"anything (?:like|similar to)", r"recommend(?:ations? for)?", r"suggest",
 ]
+if os.environ.get("R_LEAD", "1") == "0":
+    LEAD_INS = LEAD_INS[:10]
 LEAD_RE = re.compile(r"(?:" + "|".join(LEAD_INS) + r")\s+(.+?)(?:[,.;!?]|$)", re.I)
 
 # Generic English markers that a speaker is retracting a previous statement.
 OVERRIDE_CUES = ("actually", "instead", "on second thought", "changed my mind",
                  "scratch that", "never mind", "nevermind", "forget", "i'd rather",
-                 "rather than", "no wait", "correction")
+                 "rather than", "no wait", "correction",
+                 "change of plan", "new plan", "different direction", "switch to",
+                 "swap that", "make that", "let's go with", "lets go with",
+                 "in fact", "really want", "really need", "what i really",
+                 "revised", "update:", "ignore", "disregard", "drop that",
+                 "on reflection", "come to think", "second thoughts",
+                 "that's the one", "thats the one", "the real ")
+if os.environ.get("R_OVR", "1") == "0":
+    OVERRIDE_CUES = OVERRIDE_CUES[:12]
 
 # Generic English markers of a non-answer / no-opinion reply.
 NO_INFO_CUES = ("no preference", "don't have a preference", "dont have a preference",
                 "doesn't matter", "doesnt matter", "no strong", "not fussed", "not picky",
                 "up to you", "you decide", "your judgment", "your judgement", "whatever",
-                "not sure", "either is fine", "no additional")
+                "not sure", "either is fine", "no additional",
+                "additional preference", "any preference", "particular preference",
+                "really doesn't matter", "really doesnt matter", "don't mind",
+                "dont mind", "no opinion", "your call", "your pick", "you pick",
+                "surprise me", "easy on", "not bothered", "doesn't bother",
+                "either way", "no idea", "nothing else", "nothing more",
+                "can't think of anything", "cant think of anything",
+                "that's all i've got", "thats all i've got", "nope", "no strong feelings")
+if os.environ.get("R_NI", "1") == "0":
+    NO_INFO_CUES = NO_INFO_CUES[:16]
+NO_INFO_RE = re.compile(
+    r"(?:do(?:es)?n'?t|no|not|never)\b[^.!?]{0,30}\b"
+    r"(?:preference|opinion|mind|matter|care|idea|strong|fussed|picky|bother)", re.I)
 
 
 def flat_text(value) -> str:
@@ -63,6 +86,19 @@ def flat_text(value) -> str:
 
 def toks(text: str) -> list[str]:
     return [t.lower() for t in TOKEN_RE.findall(text) if len(t) > 1 and t.lower() not in STOP]
+
+
+_COARSE_EXCLUDED = {"clothing", "clothing shoes & jewelry", "clothing, shoes & jewelry"}
+
+
+def coarse_category(values) -> str:
+    cleaned: list[str] = []
+    for value in (values or []):
+        for part in str(value).split(","):
+            part = part.strip()
+            if part and part.lower() not in _COARSE_EXCLUDED:
+                cleaned.append(part)
+    return " ".join(cleaned[-2:]) if cleaned else "clothing item"
 
 
 class BM25:
@@ -119,13 +155,15 @@ class Agent:
         self.gate = gate or os.environ.get("GATE", "margin")
         self.bm25 = BM25()
         self.cat_tokens: dict[str, set[str]] = {}
+        self.coarse_cat: dict[str, str] = {}
         self.blob: dict[str, str] = {}
+        self.blob_toks: dict[str, set[str]] = {}
         self.price: dict[str, float | None] = {}
         self.store: dict[str, str] = {}
-        # vocabularies learned from the catalog's own structured detail fields
         mat_counter: Counter = Counter()
         col_counter: Counter = Counter()
 
+        cat_df: Counter = Counter()
         rows = []
         with Path(catalog_path).open(encoding="utf-8") as fh:
             for line in fh:
@@ -155,10 +193,17 @@ class Agent:
             self.bm25.add(a, [(title, 3.0), (cats, 2.0), (feats, 1.5),
                               (det, 1.2), (store, 1.0), (desc, 0.8)], bigrams=self.bigrams)
             self.cat_tokens[a] = set(toks(cats + " " + title))
+            self.coarse_cat[a] = coarse_category(p.get("categories"))
             self.blob[a] = " ".join([title, feats, det, desc]).lower()
+            self.blob_toks[a] = set(toks(self.blob[a]))
+            for t in set(toks(cats)) | set(toks(title)):
+                cat_df[t] += 1
             pr = p.get("price")
             self.price[a] = pr if isinstance(pr, (int, float)) else None
             self.store[a] = store.lower()[:30]
+        self.cat_df = dict(cat_df)
+        self.cat_df_min = max(5, len(rows) // 2000)
+        self._gaz = set().union(*self.vocab.values()) if self.vocab else set()
         self.bm25.finalize()
         self._attr_cache: dict[str, dict[str, str]] = {}
         self.state: dict[str, dict] = {}
@@ -166,7 +211,7 @@ class Agent:
     def _attrs(self, asin: str) -> dict[str, str]:
         if asin in self._attr_cache:
             return self._attr_cache[asin]
-        blob_toks = set(toks(self.blob[asin]))
+        blob_toks = self.blob_toks[asin]
         d = {}
         for attr in ("material", "color"):
             hit = blob_toks & self.vocab[attr]
@@ -180,12 +225,18 @@ class Agent:
         self._attr_cache[asin] = d
         return d
 
-    # ---------- generic NLU ----------
-
     def _extract_category(self, msg: str) -> list[str]:
         m = LEAD_RE.search(msg)
         if m:
-            return toks(m.group(1))
+            got = toks(m.group(1))
+            if got:
+                return got
+        if _flag("C_ROBUST") and self.cat_df:
+            tt = toks(msg)
+            catish = [t for t in tt if self.cat_df.get(t, 0) >= self.cat_df_min]
+            if catish:
+                return catish[:8]
+            return tt[:6]
         return toks(msg)[:6]
 
     def _is_override(self, msg: str) -> bool:
@@ -194,9 +245,40 @@ class Agent:
 
     def _is_noninformative(self, msg: str) -> bool:
         low = msg.lower()
-        return any(c in low for c in NO_INFO_CUES)
+        if any(c in low for c in NO_INFO_CUES):
+            return True
+        if not _flag("C_ROBUST"):
+            return False
+        if NO_INFO_RE.search(low):
+            return True
+        tt = set(toks(low))
+        if not tt:
+            return True
+        if tt & self._gaz:
+            return False
+        if any(self.cat_df.get(t, 0) >= self.cat_df_min for t in tt):
+            return False
+        return True
 
-    # ---------- state ----------
+    def _classify_track(self, msg: str) -> str:
+        """Turn-1 dual-track classification: 'buyer' (a stated hard
+        requirement, a budget hit, or a material/colour vocabulary hit) vs
+        'explorer' (no extractable hard constraint). A bare category mention
+        via a lead-in phrase -- "I'm looking for women's sandals" -- names
+        what the customer wants, not a requirement on it, so lead-in
+        presence alone does not make a session 'buyer'."""
+        mtoks = set(toks(msg))
+        any_constraint = any(
+            mtoks & self.vocab.get(bucket, set())
+            for bucket in ("material", "color", "style", "fit", "occasion")
+        )
+        budget_hit = bool(
+            BUDGET_BETWEEN_RE.search(msg) or BUDGET_MAX_RE.search(msg)
+            or BUDGET_MIN_RE.search(msg) or BUDGET_AROUND_RE.search(msg)
+        )
+        if any_constraint or budget_hit:
+            return "buyer"
+        return "explorer"
 
     def reset(self, session_id, user_profile):
         self.state[session_id] = {"cat": [], "turns": [], "asked": set(),
@@ -205,7 +287,7 @@ class Agent:
     def _query(self, st) -> dict[str, float]:
         q: dict[str, float] = defaultdict(float)
         for i, (turn_no, text) in enumerate(st["turns"]):
-            w = 0.15 if (st["override_at"] is not None and turn_no < st["override_at"]) else 1.0
+            w = float(os.environ.get("C_PREOVW", "0.5")) if (st["override_at"] is not None and turn_no < st["override_at"]) else 1.0
             w *= 1.0 + 0.25 * i
             tt = toks(text)
             for t in tt:
@@ -217,15 +299,13 @@ class Agent:
             q[t] += 2.0
         return q
 
-    # ---------- question policy ----------
-
     def _ask_open(self):
         return "other", "Anything else that matters to you? Any detail helps me narrow this down."
 
     def _ask_infogain(self, st, cands):
         best, best_h = None, -1.0
         total = sum(w for _, w in cands) or 1.0
-        for attr in ("material", "color", "budget", "brand"):
+        for attr in ("material", "color", "budget", "feature", "style", "use_case", "size"):
             if attr in st["asked"]:
                 continue
             groups: dict[str, float] = defaultdict(float)
@@ -234,7 +314,7 @@ class Agent:
             if len(groups) < 2:
                 continue
             h = -sum((v / total) * math.log(v / total) for v in groups.values() if v > 0)
-            h *= 1.0 - groups.get("<none>", 0.0) / total     # answerability weighting
+            h *= 1.0 - groups.get("<none>", 0.0) / total
             if h > best_h:
                 best, best_h = attr, h
         if best is None:
@@ -253,10 +333,7 @@ class Agent:
         h = -sum((v / total) * math.log(v / total) for v in groups.values() if v > 0)
         return (attr, msg) if h >= 1.0 else self._ask_open()
 
-    # ---------- confidence gate ----------
-
     def _gate_count(self, scores, turn: int) -> int:
-        """How many candidates are we willing to stand behind right now?"""
         if self.gate == "off" or not scores:
             return 10
         top = scores[0]
@@ -264,81 +341,133 @@ class Agent:
             return 10
         band = max(0.55, 0.90 - 0.10 * (turn - 1))
         n = sum(1 for s in scores[:10] if s >= band * top)
+        caps = [int(x) for x in os.environ.get("G_CAPS", "1,1,10,10,10").split(",")]
+        cap = caps[min(turn, len(caps)) - 1]
         if turn <= 2:
-            return max(1, min(n, 2))
-        if turn <= 4:
-            return max(3, min(10, n))
-        return 10
+            default_floor = 1
+        elif turn <= 4:
+            default_floor = 3
+        else:
+            default_floor = 10
+        floor = min(cap, default_floor)
+        return max(floor, min(cap, n))
 
-    # ---------- main ----------
+    def _profile_prior(self, st, asin: str) -> float:
+        """Return the bounded profile term used in the early score multiplier."""
+        profile = st.get("profile") or {}
+        tags = profile.get("preference_tags") or []
+        tagb = 0.0
+        if tags:
+            blob_toks = self.blob_toks[asin]
+            matched = sum(1 for tag in tags if set(toks(tag)) & blob_toks)
+            tagb = matched / len(tags)
+        pop_delta = self.shrunk.get(asin, self.mu) - self.mu
+        pop_span = self.pop_max_delta - self.pop_min_delta
+        popnorm = ((pop_delta - self.pop_min_delta) / pop_span) if pop_span else 0.0
+        tag_w = float(os.environ.get("C_PROFILE_TAG", "0.3"))
+        pop_w = float(os.environ.get("C_PROFILE_POP", "0.3"))
+        return tag_w * tagb + pop_w * popnorm
 
     def respond(self, session_id, user_message, turn, top_k):
         st = self.state.setdefault(session_id, {"cat": [], "turns": [], "asked": set(),
                                                 "profile": {}, "override_at": None})
+        early_rotate = os.environ.get("C_ROTATE_EARLY", "1")
         if turn > 1 and self._is_override(user_message):
             st["override_at"] = turn
             st["cat"] = []
+            if early_rotate == "2":
+                # Redundant under ShoppingCopilot: its own respond() already
+                # resets st["shown"] on override before ever delegating here,
+                # regardless of turn. This only matters if the base Agent is
+                # ever used standalone, without that outer reset.
+                st["shown"] = set()
         if not self._is_noninformative(user_message):
             st["turns"].append((turn, user_message))
         if not st["cat"]:
             c = self._extract_category(user_message)
             if c:
                 st["cat"] = c
+        if turn == 1:
+            st["track"] = self._classify_track(user_message)
 
         raw = self.bm25.score(self._query(st))
         catset = set(st["cat"])
+        use_profile = turn <= 2 and _flag("C_PROFILE", "1")
         ranked = []
         for idx, s in raw.items():
             asin = self.bm25.ids[idx]
             if catset:
                 ov = len(catset & self.cat_tokens[asin]) / len(catset)
                 s *= (1.0 + 1.2 * ov)
+            if use_profile:
+                s *= (1.0 + self._profile_prior(st, asin))
             ranked.append((s, asin))
         ranked.sort(key=lambda x: (-x[0], x[1]))
-        top = ranked[:50]
 
-        n = self._gate_count([s for s, _ in top[:10]], turn)
-        recs = [a for _, a in top[:n]]
-        cands = [(a, s) for s, a in top[:30]]
+        exclude = st.get("shown", set()) if early_rotate != "0" else set()
+        avail = [(s, a) for s, a in ranked if a not in exclude] or ranked
+        top = avail[:50]
 
-        if self.question_policy == "infogain":
-            attr, msg = self._ask_infogain(st, cands)
-        elif self.question_policy == "hybrid":
-            attr, msg = self._ask_hybrid(st, cands)
-        elif self.question_policy == "none":
-            attr, msg = None, "Here are the closest matches I found."
+        explorer_turn = (turn <= 2 and _flag("C_TRACK", "0")
+                         and st.get("track") == "explorer")
+        if explorer_turn:
+            recs = self._diverse_slate([a for _, a in top], 3)
+            attr, msg = self._ask_category(recs)
         else:
-            attr, msg = self._ask_open()
+            n = self._gate_count([s for s, _ in top[:10]], turn)
+            recs = [a for _, a in top[:n]]
+            cands = [(a, s) for s, a in top[:30]]
+
+            if self.question_policy == "infogain":
+                attr, msg = self._ask_infogain(st, cands)
+            elif self.question_policy == "hybrid":
+                attr, msg = self._ask_hybrid(st, cands)
+            elif self.question_policy == "none":
+                attr, msg = None, "Here are the closest matches I found."
+            else:
+                attr, msg = self._ask_open()
+
+        # Keep the candidate pool private in session state.  The optional LLM
+        # stage may reorder only these already-retrieved products; it can never
+        # invent or fetch a product outside the retrieval pipeline.
+        candidate_depth = max(2, int(os.environ.get("LLM_CANDIDATE_DEPTH", "12")))
+        st["_candidate_pool"] = [a for _, a in avail[:candidate_depth]]
 
         return {"message": msg, "ask_attribute": attr,
                 "recommendations": [{"parent_asin": a} for a in recs],
                 "usage": {"prompt_tokens": 0, "completion_tokens": 0}}
 
+    def _diverse_slate(self, ranked_asins: list[str], k: int) -> list[str]:
+        seen_cats: set[str] = set()
+        slate: list[str] = []
+        for a in ranked_asins:
+            c = self.coarse_cat.get(a, "")
+            if c in seen_cats:
+                continue
+            seen_cats.add(c)
+            slate.append(a)
+            if len(slate) == k:
+                break
+        if len(slate) < k:
+            for a in ranked_asins:
+                if a in slate:
+                    continue
+                slate.append(a)
+                if len(slate) == k:
+                    break
+        return slate
 
-# =============================================================================
-# ============================ PERSON C's PART ================================
-# =============================================================================
-# "Shopping Copilot" module — everything BELOW this banner was added by
-# Person C. Nothing above this banner has been modified: Person A and B's
-# code is byte-for-byte identical to their original file. This module plugs
-# in by SUBCLASSING their Agent class and reusing their helpers.
-#
-# Implements the remaining items from the team proposal:
-#   1. Extra catalog-mined vocabulary (style / fit / occasion) + a small
-#      expansion map so equivalent words widen (never replace) a filter.
-#   2. Constraint-driven hard filtering with automatic relaxation.
-#   3. Multi-route retrieval (3 query variants + rating prior) fused with
-#      Reciprocal Rank Fusion.
-#   4. Empirical-Bayes-shrunk rating quality prior.
-#   5. Refutation-driven slate rotation (never show the same product twice).
-#   6. Learning from rejection (penalise attribute values that keep
-#      appearing in rejected slates).
-#   7. Even-split question selection over the SURVIVING candidates.
-#   8. Override handling that also drops outdated hard constraints.
-#   9. Optional cross-encoder reranker behind a flag (safe no-op without it).
-# =============================================================================
+    def _ask_category(self, asins: list[str]):
+        cats = []
+        for a in asins:
+            c = self.coarse_cat.get(a, "")
+            if c and c not in cats:
+                cats.append(c)
+        if not cats:
+            return self._ask_open()
+        return "category", "Which of these are you interested in: " + ", ".join(cats) + "?"
 
-# --- budget parsing: plain-English price phrases -> a numeric price range ---
+
 _PRICE = r"\$?\s*(\d+(?:\.\d{1,2})?)"
 BUDGET_MAX_RE = re.compile(
     r"(?:under|below|less than|at most|no more than|max(?:imum)?(?: of)?|up to|cheaper than|within)\s+" + _PRICE, re.I)
@@ -347,9 +476,6 @@ BUDGET_MIN_RE = re.compile(
 BUDGET_BETWEEN_RE = re.compile(r"between\s+" + _PRICE + r"\s+(?:and|to|\-)\s+" + _PRICE, re.I)
 BUDGET_AROUND_RE = re.compile(r"(?:around|about|roughly|approximately|~)\s+" + _PRICE, re.I)
 
-# --- tiny everyday-English synonym map. Expansion only ever WIDENS a filter
-# (asking for "navy" also matches "blue") and always keeps the customer's own
-# word, so the correct product can never be expanded away. ---
 EXPAND = {
     "navy": {"blue"}, "gray": {"grey"}, "grey": {"gray"},
     "charcoal": {"gray", "grey"}, "burgundy": {"maroon", "red"},
@@ -360,10 +486,9 @@ EXPAND = {
     "woollen": {"wool"}, "wooden": {"wood"},
 }
 
-RRF_K = 60          # standard Reciprocal Rank Fusion constant
-MIN_KEEP = 25       # a hard filter must leave at least this many candidates,
-                    # otherwise it relaxes into a soft ranking boost
-SLATE_SIZE = 10     # the contract scores Top 10, so we always fill 10 slots
+RRF_K = 60
+MIN_KEEP = 25
+SLATE_SIZE = 10
 
 
 def _expand(term: str) -> set[str]:
@@ -371,23 +496,22 @@ def _expand(term: str) -> set[str]:
 
 
 def _flag(name: str, default: str = "1") -> bool:
-    """Ablation switches for the team's ablation phase, e.g. C_FILTER=0
-    disables hard filtering. Everything defaults to ON."""
     return os.environ.get(name, default) != "0"
 
 
 class ShoppingCopilot(Agent):
-    """Person C's module. Reuses A/B's index, NLU helpers and question
-    machinery; replaces the per-turn orchestration in respond()."""
-
     def __init__(self, catalog_path="data/catalog.jsonl", **kw):
-        super().__init__(catalog_path, **kw)   # A/B build their index untouched
-        # Person C's questioner defaults to the proposal's even-split policy;
-        # an explicit constructor arg or QPOLICY env var still overrides it.
+        super().__init__(catalog_path, **kw)
         self.c_qpolicy = kw.get("question_policy") or os.environ.get("QPOLICY") or "hybrid"
 
-        # ---- pass 2 over the catalog: ratings + extra vocabulary buckets ----
         style_c, fit_c, occ_c = Counter(), Counter(), Counter()
+        extra_keys = {
+            "closure": ("closure",), "department": ("department",),
+            "pattern": ("pattern",), "size": ("size",),
+            "sport": ("sport",), "shape": ("shape",),
+            "feature": ("special feature",), "age": ("age range",),
+        }
+        extra_c: dict[str, Counter] = {key: Counter() for key in extra_keys}
         self.rating: dict[str, tuple[float | None, int]] = {}
         with Path(catalog_path).open(encoding="utf-8") as fh:
             for line in fh:
@@ -409,11 +533,21 @@ class ShoppingCopilot(Agent):
                             fit_c.update(toks(str(val)))
                         if "occasion" in kl or "season" in kl:
                             occ_c.update(toks(str(val)))
-        self.vocab["style"] = {w for w, _ in style_c.most_common(40)}
-        self.vocab["fit"] = {w for w, _ in fit_c.most_common(40)}
-        self.vocab["occasion"] = {w for w, _ in occ_c.most_common(40)}
+                        for bucket, needles in extra_keys.items():
+                            if any(needle in kl for needle in needles):
+                                extra_c[bucket].update(toks(str(val)))
+        if _flag("C_VOCAB", "0"):
+            cap = int(os.environ.get("C_VOCAB_CAP", "80"))
+            for bucket, counter in (("style", style_c), ("fit", fit_c),
+                                    ("occasion", occ_c)):
+                self.vocab[bucket] = {w for w, _ in counter.most_common(cap)}
+            for bucket, counter in extra_c.items():
+                self.vocab[bucket] = {w for w, _ in counter.most_common(cap)}
+        else:
+            self.vocab["style"] = {w for w, _ in style_c.most_common(40)}
+            self.vocab["fit"] = {w for w, _ in fit_c.most_common(40)}
+            self.vocab["occasion"] = {w for w, _ in occ_c.most_common(40)}
 
-        # ---- empirical Bayes shrinkage for the rating prior ----
         tot_w = sum(n for _, n in self.rating.values())
         tot_r = sum((r or 0) * n for r, n in self.rating.values())
         self.mu = (tot_r / tot_w) if tot_w else 4.0
@@ -422,30 +556,29 @@ class ShoppingCopilot(Agent):
         self.shrunk = {}
         for a, (r, n) in self.rating.items():
             self.shrunk[a] = ((r or self.mu) * n + self.mu * self.m) / (n + self.m)
+        pop_deltas = [score - self.mu for score in self.shrunk.values()]
+        self.pop_min_delta = min(pop_deltas, default=0.0)
+        self.pop_max_delta = max(pop_deltas, default=0.0)
 
-        # ---- gazetteer inverted index: vocab term -> set of products ----
         gaz = set().union(*self.vocab.values())
+        self._gaz = gaz
         self.term_asins: dict[str, set[str]] = defaultdict(set)
         for a, blob in self.blob.items():
             for t in set(toks(blob)) & gaz:
                 self.term_asins[t].add(a)
         self.all_asins = set(self.blob)
 
-    # ---------------- session state ----------------
-
     def _c_state(self, st):
-        st.setdefault("shown", set())        # every asin ever shown (refuted)
-        st.setdefault("last_slate", [])      # what we showed on the last turn
-        st.setdefault("constraints", [])     # [(turn, bucket, {values})]
-        st.setdefault("budget", None)        # (lo, hi, turn)
-        st.setdefault("bad_values", Counter())  # (attr, value) -> rejections
+        st.setdefault("shown", set())
+        st.setdefault("last_slate", [])
+        st.setdefault("constraints", [])
+        st.setdefault("budget", None)
+        st.setdefault("bad_values", Counter())
         return st
 
     def reset(self, session_id, user_profile):
         super().reset(session_id, user_profile)
         self._c_state(self.state[session_id])
-
-    # ---------------- constraint extraction ----------------
 
     def _extract_constraints(self, st, msg: str, turn: int):
         mtoks = set(toks(msg))
@@ -483,12 +616,11 @@ class ShoppingCopilot(Agent):
             out |= vals
         return out
 
-    # ---------------- hard filtering with relaxation ----------------
-
     def _allowed_set(self, st) -> tuple[set[str], list[set[str]]]:
         allowed = self.all_asins
         soft: list[set[str]] = []
-        if not _flag("C_FILTER"):
+        mode = os.environ.get("C_FILTER", "2")
+        if mode == "0":
             return allowed, soft
         by_bucket: dict[str, set[str]] = defaultdict(set)
         for _, bucket, vals in st["constraints"]:
@@ -500,19 +632,21 @@ class ShoppingCopilot(Agent):
                     hit |= self.term_asins.get(term, set())
             if not hit:
                 continue
-            if len(allowed & hit) >= MIN_KEEP:
-                allowed = allowed & hit          # safe to filter hard
+            if mode == "2":
+                soft.append(hit)
+            elif len(allowed & hit) >= MIN_KEEP:
+                allowed = allowed & hit
             else:
-                soft.append(hit)                 # too strict -> boost instead
+                soft.append(hit)
         if st["budget"]:
             lo, hi, _ = st["budget"]
             hit = {a for a in allowed
                    if self.price[a] is None or lo <= self.price[a] <= hi}
-            if len(hit) >= MIN_KEEP:
+            if mode == "2":
+                soft.append(hit)
+            elif len(hit) >= MIN_KEEP:
                 allowed = hit
         return allowed, soft
-
-    # ---------------- retrieval routes + fusion ----------------
 
     def _bm25_route(self, qterms, allowed, catset, limit=300,
                     return_scores=False):
@@ -524,7 +658,7 @@ class ShoppingCopilot(Agent):
                 continue
             if catset:
                 ov = len(catset & self.cat_tokens[a]) / len(catset)
-                s *= (1.0 + 1.2 * ov)            # A/B's category boost, reused
+                s *= (1.0 + 1.2 * ov)
             out.append((s, a))
         out.sort(key=lambda x: (-x[0], x[1]))
         if return_scores:
@@ -544,37 +678,32 @@ class ShoppingCopilot(Agent):
         catset = set(st["cat"])
         routes: list[list[str]] = []
 
-        # route 1: A/B's full-history query (their weighting, untouched).
-        # Its RAW scores are kept: A/B's confidence gate reads score ratios,
-        # which fusion would flatten.
         r1 = self._bm25_route(self._query(st), allowed, catset, limit=300,
                               return_scores=True)
         raw1 = dict((a, s) for a, s in r1)
         routes.append([a for a, _ in r1])
 
-        # route 2: constraints only
         stated = self._stated_values(st)
         if stated:
             q = self._terms_from(sorted(stated) + st["cat"], 1.0)
             routes.append(self._bm25_route(q, allowed, catset))
 
-        # route 3: latest informative turn, plus the category
         if st["turns"]:
             last = toks(st["turns"][-1][1])
             routes.append(self._bm25_route(
                 self._terms_from(last + st["cat"], 1.0), allowed, catset))
 
-        if not _flag("C_ROUTES"):
+        if not _flag("C_ROUTES", "0"):
             routes = routes[:1]
         pool: set[str] = set().union(*routes) if routes else set()
 
-        # route 4: soft-constraint boost (buckets too strict to hard-filter)
-        if soft and pool:
+        soft_mode = os.environ.get("C_FILTER", "2") == "2"
+
+        if soft and pool and not soft_mode:
             scored = sorted(pool, key=lambda a: (-sum(a in s for s in soft),
                                                  -self.shrunk[a], a))
             routes.append(scored[:300])
 
-        # route 5: rating quality prior over the pooled candidates
         if pool:
             routes.append(sorted(pool, key=lambda a: (-self.shrunk[a], a))[:300])
 
@@ -584,7 +713,14 @@ class ShoppingCopilot(Agent):
             for rank, a in enumerate(route, start=1):
                 fused[a] += w / (RRF_K + rank)
 
-        # learning from rejection: gentle multiplicative penalty
+        if soft_mode and soft:
+            boost = float(os.environ.get("C_SOFT_BOOST", "0.05"))
+            total = len(soft)
+            for a in list(fused):
+                matched = sum(1 for s in soft if a in s)
+                if matched:
+                    fused[a] += boost * (matched / total)
+
         bad = st["bad_values"]
         if bad and _flag("C_PENALTY"):
             for a in list(fused):
@@ -594,11 +730,7 @@ class ShoppingCopilot(Agent):
                     fused[a] *= 0.93 ** min(flags, 3)
         return sorted(fused.items(), key=lambda x: (-x[1], x[0])), raw1
 
-    # ---------------- optional reranker (off by default) ----------------
-
     def _maybe_rerank(self, st, ranked):
-        """Cross-encoder rerank behind RERANKER=ce. Safe no-op if the library
-        or model is unavailable, so the agent runs with no network/deps."""
         if os.environ.get("RERANKER") != "ce" or len(ranked) < 2:
             return ranked
         try:
@@ -614,7 +746,38 @@ class ShoppingCopilot(Agent):
         head = [ab for _, ab in sorted(zip([-s for s in scores], head))]
         return head + ranked[40:]
 
-    # ---------------- learning from rejection ----------------
+    def _state_score(self, st, asin: str) -> float:
+        score = 0.0
+        for t, _bucket, vals in st["constraints"]:
+            recency = 1.0 + 0.3 * (t - 1)
+            for v in vals:
+                for term in _expand(v):
+                    if asin in self.term_asins.get(term, ()):
+                        idf = self.bm25.idf.get(term, 0.0)
+                        score += recency * (idf if idf > 0 else 0.1)
+        bad = st["bad_values"]
+        if bad:
+            penalty = sum(bad.get((attr, val), 0)
+                          for attr, val in self._attrs(asin).items())
+            if penalty:
+                score -= 0.5 * penalty
+        return score
+
+    def _state_rerank(self, st, ranked, turn: int):
+        if not _flag("C_RERANK", "0") or turn < 3 or len(ranked) < 2:
+            return ranked
+        top10 = ranked[:10]
+        rest = ranked[10:]
+        top_score = top10[0][1]
+        if top_score <= 0:
+            return ranked
+        second_score = top10[1][1] if len(top10) > 1 else 0.0
+        margin = (top_score - second_score) / top_score
+        margin_thresh = float(os.environ.get("C_RERANK_MARGIN", "0.15"))
+        if margin >= margin_thresh:
+            return ranked
+        rescored = sorted(top10, key=lambda x: (-self._state_score(st, x[0]), -x[1]))
+        return rescored + rest
 
     def _learn_from_rejection(self, st):
         slate = st["last_slate"]
@@ -631,21 +794,20 @@ class ShoppingCopilot(Agent):
             if c >= max(2, int(0.6 * len(slate))):
                 st["bad_values"][(attr, val)] += 1
 
-    # ---------------- main per-turn orchestration ----------------
-
     def respond(self, session_id, user_message, turn, top_k):
         st = self._c_state(self.state.setdefault(
             session_id, {"cat": [], "turns": [], "asked": set(),
                          "profile": {}, "override_at": None}))
 
-        # Turns before the rescue point run Person A/B's code UNCHANGED, via
-        # super(); Person C only records what was shown. Testing showed the
-        # simulated customer's replies depend on the slate, so perturbing the
-        # early turns degrades the whole dialogue. C's machinery therefore
-        # takes over only once the base agent has stalled: from then on,
-        # re-showing the same slate is a guaranteed miss, so rotating in
-        # fresh, fused, constraint-aware candidates can only help.
-        rescue_at = int(os.environ.get("C_RESCUE_TURN", "5"))
+        if turn > 1 and self._is_override(user_message):
+            st["override_at"] = turn
+            self._drop_stale_constraints(st, turn)
+            st["shown"] = set()
+            st["bad_values"] = Counter()
+            st["last_slate"] = []
+            st["asked"] = set()
+
+        rescue_at = int(os.environ.get("C_RESCUE_TURN", "4"))
         if turn < rescue_at:
             out = super().respond(session_id, user_message, turn, top_k)
             slate = [r["parent_asin"] for r in out["recommendations"]]
@@ -653,25 +815,15 @@ class ShoppingCopilot(Agent):
             st["shown"].update(slate)
             return out
 
-        # ---------------- rescue mode: Person C's pipeline ----------------
-        # the session continuing proves every slate so far was wrong
         self._learn_from_rejection(st)
         st["shown"].update(st["last_slate"])
 
-        # first rescue turn: rebuild constraints from the stored dialogue
-        # (turns are stored with their turn number, so overrides still apply)
         if not st.get("c_replayed"):
             st["c_replayed"] = True
             ov = st["override_at"] or 0
             for t, text in st["turns"]:
                 if t >= ov:
                     self._extract_constraints(st, text, t)
-
-        # override: drop, don't blend (A/B's detector + C's invalidation)
-        if turn > 1 and self._is_override(user_message):
-            st["override_at"] = turn
-            st["cat"] = []
-            self._drop_stale_constraints(st, turn)
 
         if not self._is_noninformative(user_message):
             st["turns"].append((turn, user_message))
@@ -681,29 +833,29 @@ class ShoppingCopilot(Agent):
             if c:
                 st["cat"] = c
 
-        # constraints -> hard filter -> multi-route retrieval -> fusion
         allowed, soft = self._allowed_set(st)
         ranked, raw1 = self._fuse(st, allowed, soft)
         ranked = self._maybe_rerank(st, ranked)
+        ranked = self._state_rerank(st, ranked, turn)
+        if turn <= 2 and _flag("C_PROFILE", "1"):
+            ranked = sorted(
+                ((a, s * (1.0 + self._profile_prior(st, a))) for a, s in ranked),
+                key=lambda x: (-x[1], x[0]))
 
-        # slate rotation: only candidates never shown before
         k = min(SLATE_SIZE, top_k or SLATE_SIZE)
         exclude = st["shown"] if _flag("C_ROTATE") else set()
         avail = [(a, s) for a, s in ranked if a not in exclude]
-        # A/B's confidence gate, fed the raw BM25 scores of the survivors:
-        # early turns show only what we would stand behind, which protects MRR
         gate_scores = sorted((raw1.get(a, 0.0) for a, _ in avail[:10]),
                              reverse=True)
         k = min(k, self._gate_count(gate_scores, turn))
         slate = [a for a, _ in avail][:k]
-        if len(slate) < k:                       # backfill so no slot is wasted
+        if len(slate) < k:
             for a in sorted(allowed - st["shown"] - set(slate),
                             key=lambda a: (-self.shrunk[a], a)):
                 slate.append(a)
                 if len(slate) == k:
                     break
 
-        # even-split question over the SURVIVORS (reuses A/B's machinery)
         cands = [(a, s) for a, s in ranked[:30] if a not in st["shown"]] \
             or [(a, 1.0) for a in slate]
         qp = self.c_qpolicy
@@ -716,13 +868,236 @@ class ShoppingCopilot(Agent):
         else:
             attr, msg = self._ask_hybrid(st, cands)
 
+        candidate_depth = max(2, int(os.environ.get("LLM_CANDIDATE_DEPTH", "12")))
+        st["_candidate_pool"] = [a for a, _ in avail[:candidate_depth]]
         st["last_slate"] = slate
         return {"message": msg, "ask_attribute": attr,
                 "recommendations": [{"parent_asin": a} for a in slate],
                 "usage": {"prompt_tokens": 0, "completion_tokens": 0}}
 
 
-# The evaluator does `from starter.agent import Agent`, so pointing the name
-# `Agent` at Person C's subclass activates this module without touching any
-# of Person A/B's code above.
-Agent = ShoppingCopilot
+def _safe_json_object(text: str) -> dict:
+    """Parse a JSON object, tolerating a fenced model response."""
+    if not text:
+        return {}
+    cleaned = re.sub(r"^```(?:json)?\s*", "", text.strip(), flags=re.I)
+    cleaned = re.sub(r"\s*```$", "", cleaned, flags=re.I)
+    try:
+        value = json.loads(cleaned)
+        return value if isinstance(value, dict) else {}
+    except Exception:
+        match = re.search(r"\{.*\}", cleaned, flags=re.S)
+        if not match:
+            return {}
+        try:
+            value = json.loads(match.group(0))
+            return value if isinstance(value, dict) else {}
+        except Exception:
+            return {}
+
+
+class GeminiCandidateRanker:
+    """Gemini ranking stage with a fail-closed, zero-change fallback."""
+
+    def __init__(self):
+        self.model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite")
+        self.api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+        self.client = None
+        self.types = None
+
+        if not self.api_key or os.environ.get("LLM_ENABLED", "1") == "0":
+            return
+
+        try:
+            from google import genai  # type: ignore
+            from google.genai import types  # type: ignore
+
+            self.client = genai.Client(api_key=self.api_key)
+            self.types = types
+        except Exception:
+            # Missing package, invalid setup, or unavailable runtime: the base
+            # ShoppingCopilot remains fully operational.
+            self.client = None
+            self.types = None
+
+    @property
+    def available(self) -> bool:
+        return self.client is not None and self.types is not None
+
+    def rank(self, intent: dict, candidates: list[dict]) -> tuple[list[str], dict]:
+        if not self.available or len(candidates) < 2:
+            return [], {"prompt_tokens": 0, "completion_tokens": 0}
+
+        prompt = (
+            "You are the semantic ranking stage of a shopping search system.\n"
+            "Rank only the supplied candidates for the shopper's CURRENT intent.\n"
+            "Priority: (1) explicit current requirements, (2) correct product "
+            "category, (3) current preferences, (4) overall relevance.\n"
+            "An override makes the newest request more important, but do not "
+            "discard unrelated compatible requirements.\n"
+            "Never invent IDs. Return every candidate ID exactly once.\n\n"
+            "CURRENT INTENT:\n"
+            + json.dumps(intent, ensure_ascii=False)
+            + "\n\nCANDIDATES IN RETRIEVAL ORDER:\n"
+            + json.dumps(candidates, ensure_ascii=False)
+            + '\n\nReturn JSON only: {"ranking":["ID1","ID2"]}'
+        )
+
+        usage = {"prompt_tokens": 0, "completion_tokens": 0}
+        try:
+            response = self.client.models.generate_content(
+                model=self.model,
+                contents=prompt,
+                config=self.types.GenerateContentConfig(
+                    temperature=0,
+                    response_mime_type="application/json",
+                ),
+            )
+
+            metadata = getattr(response, "usage_metadata", None)
+            if metadata is not None:
+                usage["prompt_tokens"] = int(
+                    getattr(metadata, "prompt_token_count", 0) or 0
+                )
+                usage["completion_tokens"] = int(
+                    getattr(metadata, "candidates_token_count", 0) or 0
+                )
+
+            parsed = _safe_json_object(getattr(response, "text", ""))
+            ranking = parsed.get("ranking", [])
+            if not isinstance(ranking, list):
+                return [], usage
+            return [str(value).strip() for value in ranking if str(value).strip()], usage
+        except Exception:
+            return [], usage
+
+
+class LLMAgent(ShoppingCopilot):
+    """Existing high-scoring agent plus optional Gemini candidate reranking.
+
+    The base retrieval result is always produced first. Gemini sees a bounded
+    candidate pool and may only reorder validated IDs from that pool. If the
+    model is unavailable, times out, or returns malformed output, the method
+    returns the original response unchanged.
+    """
+
+    def __init__(self, catalog_path="data/catalog.jsonl", **kwargs):
+        super().__init__(catalog_path=catalog_path, **kwargs)
+        self.llm_ranker = GeminiCandidateRanker()
+
+    def _llm_intent(self, st: dict, user_message: str, turn: int) -> dict:
+        override_at = st.get("override_at")
+        messages = [
+            {"turn": t, "text": text, "current": override_at is None or t >= override_at}
+            for t, text in st.get("turns", [])[-4:]
+        ]
+        constraints = []
+        for t, bucket, values in st.get("constraints", []):
+            constraints.append({
+                "turn": t,
+                "attribute": bucket,
+                "values": sorted(str(v) for v in values),
+            })
+        budget = st.get("budget")
+        return {
+            "turn": turn,
+            "latest_message": user_message,
+            "track": st.get("track", "unknown"),
+            "category_terms": list(st.get("cat", [])),
+            "override_at": override_at,
+            "recent_messages": messages,
+            "constraints": constraints,
+            "budget": list(budget) if budget else None,
+        }
+
+    def _candidate_cards(self, candidate_ids: list[str]) -> list[dict]:
+        text_limit = max(200, int(os.environ.get("LLM_PRODUCT_TEXT", "800")))
+        return [
+            {
+                "parent_asin": asin,
+                "retrieval_rank": rank,
+                "category": self.coarse_cat.get(asin, ""),
+                "brand": self.store.get(asin, ""),
+                "price": self.price.get(asin),
+                "product_text": self.blob.get(asin, "")[:text_limit],
+            }
+            for rank, asin in enumerate(candidate_ids, start=1)
+        ]
+
+    @staticmethod
+    def _validate_ranking(returned: list[str], candidates: list[str]) -> list[str]:
+        allowed = set(candidates)
+        seen = set()
+        valid = []
+        for asin in returned:
+            if asin in allowed and asin not in seen:
+                valid.append(asin)
+                seen.add(asin)
+        valid.extend(asin for asin in candidates if asin not in seen)
+        return valid
+
+    @staticmethod
+    def _blend_rankings(retrieval: list[str], llm: list[str]) -> list[str]:
+        # A value above 0.5 lets Gemini change the order; lower values preserve
+        # more of BM25. Test 0.35, 0.50, and 0.65 on the public evaluator.
+        alpha = max(0.0, min(1.0, float(os.environ.get("LLM_WEIGHT", "0.55"))))
+        retrieval_rank = {asin: rank for rank, asin in enumerate(retrieval, start=1)}
+        llm_rank = {asin: rank for rank, asin in enumerate(llm, start=1)}
+        n = max(1, len(retrieval))
+
+        def score(asin: str) -> float:
+            retrieval_value = (n - retrieval_rank[asin] + 1) / n
+            llm_value = (n - llm_rank.get(asin, n) + 1) / n
+            return (1.0 - alpha) * retrieval_value + alpha * llm_value
+
+        return sorted(retrieval, key=lambda asin: (-score(asin), retrieval_rank[asin]))
+
+    def respond(self, session_id, user_message, turn, top_k):
+        st_before = self.state.get(session_id, {})
+        shown_before = set(st_before.get("shown", set()))
+        result = super().respond(session_id, user_message, turn, top_k)
+
+        if not self.llm_ranker.available:
+            return result
+
+        st = self.state.get(session_id, {})
+        candidates = list(dict.fromkeys(st.get("_candidate_pool", [])))
+        original = [
+            str(item.get("parent_asin", ""))
+            for item in result.get("recommendations", [])
+            if isinstance(item, dict) and item.get("parent_asin")
+        ]
+        if len(candidates) < 2 or not original:
+            return result
+
+        # Ensure every originally returned recommendation remains eligible.
+        candidates = list(dict.fromkeys(original + candidates))
+        depth = max(2, int(os.environ.get("LLM_CANDIDATE_DEPTH", "12")))
+        candidates = candidates[:depth]
+
+        returned, usage = self.llm_ranker.rank(
+            self._llm_intent(st, user_message, turn),
+            self._candidate_cards(candidates),
+        )
+        result["usage"] = usage
+        if not returned:
+            return result
+
+        validated = self._validate_ranking(returned, candidates)
+        blended = self._blend_rankings(candidates, validated)
+        output_count = min(len(original), max(1, int(top_k or len(original))))
+        final_ids = blended[:output_count]
+        result["recommendations"] = [
+            {"parent_asin": asin} for asin in final_ids
+        ]
+
+        # Keep rejection-learning and rotation state aligned with what the user
+        # actually saw, including the early-turn path that marks items shown.
+        shown_after = set(st.get("shown", set()))
+        if set(original) & (shown_after - shown_before):
+            st["shown"] = shown_before | set(final_ids)
+        st["last_slate"] = final_ids
+        return result
+
+
+Agent = LLMAgent
