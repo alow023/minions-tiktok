@@ -143,6 +143,7 @@ class Agent:
         self.bm25 = BM25()
         self.cat_tokens: dict[str, set[str]] = {}
         self.blob: dict[str, str] = {}
+        self.blob_toks: dict[str, set[str]] = {}
         self.price: dict[str, float | None] = {}
         self.store: dict[str, str] = {}
         mat_counter: Counter = Counter()
@@ -179,6 +180,7 @@ class Agent:
                               (det, 1.2), (store, 1.0), (desc, 0.8)], bigrams=self.bigrams)
             self.cat_tokens[a] = set(toks(cats + " " + title))
             self.blob[a] = " ".join([title, feats, det, desc]).lower()
+            self.blob_toks[a] = set(toks(self.blob[a]))
             for t in set(toks(cats)) | set(toks(title)):
                 cat_df[t] += 1
             pr = p.get("price")
@@ -194,7 +196,7 @@ class Agent:
     def _attrs(self, asin: str) -> dict[str, str]:
         if asin in self._attr_cache:
             return self._attr_cache[asin]
-        blob_toks = set(toks(self.blob[asin]))
+        blob_toks = self.blob_toks[asin]
         d = {}
         for attr in ("material", "color"):
             hit = blob_toks & self.vocab[attr]
@@ -315,6 +317,22 @@ class Agent:
         floor = min(cap, default_floor)
         return max(floor, min(cap, n))
 
+    def _profile_prior(self, st, asin: str) -> float:
+        """Return the bounded profile term used in the early score multiplier."""
+        profile = st.get("profile") or {}
+        tags = profile.get("preference_tags") or []
+        tagb = 0.0
+        if tags:
+            blob_toks = self.blob_toks[asin]
+            matched = sum(1 for tag in tags if set(toks(tag)) & blob_toks)
+            tagb = matched / len(tags)
+        pop_delta = self.shrunk.get(asin, self.mu) - self.mu
+        pop_span = self.pop_max_delta - self.pop_min_delta
+        popnorm = ((pop_delta - self.pop_min_delta) / pop_span) if pop_span else 0.0
+        tag_w = float(os.environ.get("C_PROFILE_TAG", "0.3"))
+        pop_w = float(os.environ.get("C_PROFILE_POP", "0.3"))
+        return tag_w * tagb + pop_w * popnorm
+
     def respond(self, session_id, user_message, turn, top_k):
         st = self.state.setdefault(session_id, {"cat": [], "turns": [], "asked": set(),
                                                 "profile": {}, "override_at": None})
@@ -337,12 +355,15 @@ class Agent:
 
         raw = self.bm25.score(self._query(st))
         catset = set(st["cat"])
+        use_profile = turn <= 2 and _flag("C_PROFILE", "1")
         ranked = []
         for idx, s in raw.items():
             asin = self.bm25.ids[idx]
             if catset:
                 ov = len(catset & self.cat_tokens[asin]) / len(catset)
                 s *= (1.0 + 1.2 * ov)
+            if use_profile:
+                s *= (1.0 + self._profile_prior(st, asin))
             ranked.append((s, asin))
         ranked.sort(key=lambda x: (-x[0], x[1]))
 
@@ -456,6 +477,9 @@ class ShoppingCopilot(Agent):
         self.shrunk = {}
         for a, (r, n) in self.rating.items():
             self.shrunk[a] = ((r or self.mu) * n + self.mu * self.m) / (n + self.m)
+        pop_deltas = [score - self.mu for score in self.shrunk.values()]
+        self.pop_min_delta = min(pop_deltas, default=0.0)
+        self.pop_max_delta = max(pop_deltas, default=0.0)
 
         gaz = set().union(*self.vocab.values())
         self._gaz = gaz
@@ -734,6 +758,10 @@ class ShoppingCopilot(Agent):
         ranked, raw1 = self._fuse(st, allowed, soft)
         ranked = self._maybe_rerank(st, ranked)
         ranked = self._state_rerank(st, ranked, turn)
+        if turn <= 2 and _flag("C_PROFILE", "1"):
+            ranked = sorted(
+                ((a, s * (1.0 + self._profile_prior(st, a))) for a, s in ranked),
+                key=lambda x: (-x[1], x[0]))
 
         k = min(SLATE_SIZE, top_k or SLATE_SIZE)
         exclude = st["shown"] if _flag("C_ROTATE") else set()
