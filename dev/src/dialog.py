@@ -12,7 +12,7 @@ import logging
 import re
 from collections import Counter
 
-from starter.stub_ranker import rank as stub_rank
+from legacy_starter.stub_ranker import rank as stub_rank
 
 LOGGER = logging.getLogger(__name__)
 

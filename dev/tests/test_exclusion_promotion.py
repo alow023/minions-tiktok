@@ -4,7 +4,7 @@ import unittest
 from itertools import combinations
 
 from src.dialog import DialogController
-from starter.stub_ranker import rank
+from legacy_starter.stub_ranker import rank
 
 PROFILE = {
     "purchase_frequency": "3-4 prior purchases",

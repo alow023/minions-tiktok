@@ -1,0 +1,17 @@
+# starter/agent.py and evaluator/local_evaluator.py are Python standard
+# library only (json, math, os, re, collections, pathlib, argparse,
+# statistics, random, uuid) -- no third-party packages are required to
+# reproduce the reported technical score.
+#
+# Minimum Python version: 3.10. The code uses PEP 604 union syntax
+# (`str | None`) and PEP 585 generic collection syntax (`set[str]`) as bare
+# (non-string) type hints.
+#
+# Optional, NOT used for the reported score: setting RERANKER=ce enables an
+# alternate cross-encoder reranking path (starter/agent.py's
+# `_maybe_rerank`) that imports sentence_transformers at call time. This
+# path is off by default (RERANKER unset) and was not used to produce any
+# of the scores in docs/CONFIGURATION.md or docs/baseline_results.json.
+# Install it only if you intend to experiment with RERANKER=ce:
+#
+#   sentence-transformers
