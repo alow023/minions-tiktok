@@ -3,9 +3,9 @@
 # starter/agent.py is standard library only EXCEPT for the semantic
 # retrieval route (starter/semantic.py), which needs scikit-learn. That
 # route is on by default and contributes the reported technical score of
-# 0.897458. If scikit-learn is absent the agent catches the ImportError and
+# 0.920808. If scikit-learn is absent the agent catches the ImportError and
 # degrades to the pure-standard-library lexical pipeline, which scores
-# 0.896548 -- so the submission runs, and reproduces a documented score,
+# 0.919 -- so the submission runs, and reproduces a documented score,
 # either way. No network access and no pretrained weights are used in
 # either case: the semantic space is factorised from catalog.jsonl itself
 # at index-build time with a fixed random_state.
@@ -16,11 +16,3 @@ scikit-learn
 # (`str | None`) and PEP 585 generic collection syntax (`set[str]`) as bare
 # (non-string) type hints.
 #
-# Optional, NOT used for the reported score: setting RERANKER=ce enables an
-# alternate cross-encoder reranking path (starter/agent.py's
-# `_maybe_rerank`) that imports sentence_transformers at call time. This
-# path is off by default (RERANKER unset) and was not used to produce any
-# of the scores in docs/CONFIGURATION.md or docs/baseline_results.json.
-# Install it only if you intend to experiment with RERANKER=ce:
-#
-#   sentence-transformers

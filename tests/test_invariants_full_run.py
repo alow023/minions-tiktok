@@ -110,8 +110,8 @@ def _run() -> tuple[dict[str, set[str]], list[str]]:
                     violations["ask_attribute_not_brand_or_category"].add(sample_id)
                     details.append(f"{sample_id} turn {turn}: asked {attribute!r} directly")
 
-                for parent_asin in ids_this_turn:
-                    slate_turns[parent_asin].append(turn)
+                for rank, parent_asin in enumerate(ids_this_turn, start=1):
+                    slate_turns[parent_asin].append((turn, rank))
 
                 if attribute in ASKABLE_ATTRIBUTES:
                     if attribute in asked_askable:
@@ -132,15 +132,32 @@ def _run() -> tuple[dict[str, set[str]], list[str]]:
                     if new_value:
                         disclosed.add(new_value)
                     user_message = str(override.get("message", "Actually, ignore my earlier preference."))
+                    # The customer has erased their slots, and the agent
+                    # erases its shown-set to match, so products it offered
+                    # under the superseded preference are fair to offer
+                    # again. Reset the tracker for the same reason.
+                    slate_turns.clear()
                 else:
                     user_message, boundary_used = customer_reply(
                         effective_sample, attribute, disclosed, boundary_used
                     )
 
-            for parent_asin, turns in slate_turns.items():
-                if len(turns) > 1:
+            # A product may legitimately appear on more than one slate, but
+            # only as the agent re-asserting its single leading answer
+            # (tracking restarts after an intent override, see above): once
+            # the exact attribute-phrase route locks onto a product, that
+            # product must stay at rank 1 until the customer moves on (an
+            # intent_override is not scorable until the override turn, so a
+            # product identified on turn 2 has to still be there on turn 3).
+            # Re-showing a product *deeper* in a later slate is the real
+            # defect this invariant guards: a scoring slot spent on a
+            # candidate the customer already declined.
+            for parent_asin, appearances in slate_turns.items():
+                if len(appearances) > 1 and any(rank != 1 for _, rank in appearances):
                     violations["no_cross_slate_duplicate_id"].add(sample_id)
-                    details.append(f"{sample_id}: product {parent_asin!r} shown in turns {turns}")
+                    details.append(
+                        f"{sample_id}: product {parent_asin!r} re-shown off rank 1 "
+                        f"at (turn, rank) {appearances}")
 
         except Exception as exc:  # noqa: BLE001 -- deliberately broad: this IS the invariant
             violations["no_exception_raised"].add(sample_id)

@@ -1,29 +1,22 @@
 # dev/
 
-Archived code from an earlier design (`src.dialog.DialogController` plus its
-`legacy_starter/stub_ranker.py` and `legacy_starter/dialog_controller.py`
-support). None of it is on the shipped path — the evaluator and CI only ever
-import `starter.agent.Agent` at the repo root.
+Development-time tooling. Nothing here is on the shipped path — the evaluator
+and CI only ever import `starter.agent.Agent`.
 
-Kept for reference, not deleted outright, because the test suite in
-`dev/tests/` documents behavior (question selection, penalty splitting,
-override handling, exclusion/promotion) that this project cared about at an
-earlier stage of the design.
+- `robustness/paraphrase_eval.py` — rewrites the simulator's utterances at four
+  severities (`none`/`light`/`medium`/`heavy`) *without* modifying the
+  evaluator, and re-scores the shipped agent against them. Results in
+  `robustness/res_*.json`; see `docs/ABLATION.md` §3.6 and §3.10.
+  Run: `python3 -m dev.robustness.paraphrase_eval heavy`
+- `robustness/diagnose.py` — per-session diagnostics for a scored run.
+- `run_eval_parallel.py` — multiprocess wrapper around the official evaluator's
+  own `evaluate`/`metric_summary` functions. Identical metrics, much faster on
+  a multi-core box. Report scores from `python3 -m evaluator.local_evaluator`.
+  Run: `NPROC=8 python3 dev/run_eval_parallel.py results.json`
+- `run_reproducibility_check.py` — re-runs the evaluator and checks the score
+  is bit-identical across runs.
 
-## Running the tests here
-
-`dev/legacy_starter/` is deliberately named differently from the root
-`starter/` package so the two don't shadow each other on `sys.path`. To run
-this directory's tests, put both the repo root (for `evaluator`) and `dev/`
-(for `src` and `legacy_starter`) on the path:
-
-```
-PYTHONPATH=.:dev python3 -m unittest discover -s dev/tests
-```
-
-Also here: `diagnose_buckets.py` and `run_reproducibility_check.py`, which
-moved out of the repo root because they reach into `evaluator.local_evaluator`
-helper functions (`classify_constraint`, `intent_card`, ...) rather than
-staying on the small surface (`catalog_index`, `evaluate`, `load_jsonl`) that
-the shipped scripts use, and `run_dialog_stub_ranker.py`, which drives the
-archived `src.dialog.DialogController` directly.
+The archived pre-BM25 dialog stack (`src/dialog.py`, `legacy_starter/`, and the
+30 unit tests that exercised them) was removed once the shipped architecture
+had fully superseded it; it is recoverable from git history at `f7e7dba`
+onwards. Its useful behavioural coverage lives on in `tests/`.

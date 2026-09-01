@@ -13,6 +13,8 @@ import re
 from collections import Counter, defaultdict
 from pathlib import Path
 
+from starter.intent_index import IntentIndex, parse_message
+
 TOKEN_RE = re.compile(r"[a-z0-9]+", re.I)
 
 # Standard English function words.
@@ -88,19 +90,6 @@ def toks(text: str) -> list[str]:
     return [t.lower() for t in TOKEN_RE.findall(text) if len(t) > 1 and t.lower() not in STOP]
 
 
-_COARSE_EXCLUDED = {"clothing", "clothing shoes & jewelry", "clothing, shoes & jewelry"}
-
-
-def coarse_category(values) -> str:
-    cleaned: list[str] = []
-    for value in (values or []):
-        for part in str(value).split(","):
-            part = part.strip()
-            if part and part.lower() not in _COARSE_EXCLUDED:
-                cleaned.append(part)
-    return " ".join(cleaned[-2:]) if cleaned else "clothing item"
-
-
 class BM25:
     """Field-weighted BM25 with unigrams + bigrams."""
 
@@ -155,7 +144,6 @@ class Agent:
         self.gate = gate or os.environ.get("GATE", "margin")
         self.bm25 = BM25()
         self.cat_tokens: dict[str, set[str]] = {}
-        self.coarse_cat: dict[str, str] = {}
         self.blob: dict[str, str] = {}
         self.blob_toks: dict[str, set[str]] = {}
         self.price: dict[str, float | None] = {}
@@ -193,7 +181,6 @@ class Agent:
             self.bm25.add(a, [(title, 3.0), (cats, 2.0), (feats, 1.5),
                               (det, 1.2), (store, 1.0), (desc, 0.8)], bigrams=self.bigrams)
             self.cat_tokens[a] = set(toks(cats + " " + title))
-            self.coarse_cat[a] = coarse_category(p.get("categories"))
             self.blob[a] = " ".join([title, feats, det, desc]).lower()
             self.blob_toks[a] = set(toks(self.blob[a]))
             for t in set(toks(cats)) | set(toks(title)):
@@ -205,6 +192,8 @@ class Agent:
         self.cat_df_min = max(5, len(rows) // 2000)
         self._gaz = set().union(*self.vocab.values()) if self.vocab else set()
         self.bm25.finalize()
+        # --- Pillar I: exact attribute-phrase route (see starter/intent_index) ---
+        self.iindex = IntentIndex(catalog_path) if _flag("C_FP", "1") else None
         self._attr_cache: dict[str, dict[str, str]] = {}
         self.state: dict[str, dict] = {}
 
@@ -281,29 +270,94 @@ class Agent:
                 return None
         return self._dense
 
-    def _classify_track(self, msg: str) -> str:
-        """Turn-1 dual-track classification: 'buyer' (a stated hard
-        requirement, a budget hit, or a material/colour vocabulary hit) vs
-        'explorer' (no extractable hard constraint). A bare category mention
-        via a lead-in phrase -- "I'm looking for women's sandals" -- names
-        what the customer wants, not a requirement on it, so lead-in
-        presence alone does not make a session 'buyer'."""
-        mtoks = set(toks(msg))
-        any_constraint = any(
-            mtoks & self.vocab.get(bucket, set())
-            for bucket in ("material", "color", "style", "fit", "occasion")
-        )
-        budget_hit = bool(
-            BUDGET_BETWEEN_RE.search(msg) or BUDGET_MAX_RE.search(msg)
-            or BUDGET_MIN_RE.search(msg) or BUDGET_AROUND_RE.search(msg)
-        )
-        if any_constraint or budget_hit:
-            return "buyer"
-        return "explorer"
-
     def reset(self, session_id, user_profile):
         self.state[session_id] = {"cat": [], "turns": [], "asked": set(),
-                                  "profile": user_profile or {}, "override_at": None}
+                                  "profile": user_profile or {}, "override_at": None,
+                                  "fp_cat": None, "fp_phrases": [], "fp_seen": set()}
+
+    # ------------------------------------------------------------------
+    # Exact attribute-phrase route (Pillar I high-precision track)
+    # ------------------------------------------------------------------
+    def _fp_observe(self, st, msg: str, turn: int) -> None:
+        """Accumulate the attribute phrases and category a shopper states.
+
+        Slots accumulate incrementally across turns; a phrase already stated
+        is not counted twice."""
+        if self.iindex is None:
+            return
+        st.setdefault("fp_phrases", [])
+        st.setdefault("fp_seen", set())
+        done = st.setdefault("fp_turns", set())
+        if turn in done:
+            return
+        done.add(turn)
+        cat, phrases = parse_message(msg)
+        if cat and not st.get("fp_cat"):
+            st["fp_cat"] = cat
+        for ph in phrases:
+            key = ph.lower()
+            if key in st["fp_seen"]:
+                continue
+            st["fp_seen"].add(key)
+            st["fp_phrases"].append((turn, ph))
+
+    def _fp_scores(self, st) -> dict[str, float]:
+        """Evidence scores over the catalog for the phrases stated so far.
+
+        Pre-override turns are down-weighted rather than discarded: an
+        override rewrites a preference, not the shopping mission, so the
+        earlier turns remain weaker-but-real evidence."""
+        if self.iindex is None or not st.get("fp_phrases"):
+            return {}
+        ovr = st.get("override_at")
+        pre_w = float(os.environ.get("C_FP_PREOVW", "0.5"))
+        weighted = [
+            (ph, pre_w if (ovr is not None and t < ovr) else 1.0)
+            for t, ph in st["fp_phrases"]
+        ]
+        return self.iindex.score_w(
+            weighted, st.get("fp_cat"),
+            cat_bonus=float(os.environ.get("C_FP_CATBONUS", "1.0")))
+
+    def _fp_blend(self, st, ranked):
+        """Fuse the phrase route into a lexical ranking.
+
+        ``ranked`` is ``[(score, asin)]`` descending. Lexical scores are
+        max-normalised so the two routes are commensurable, then the phrase
+        evidence is added with weight ``C_FP_W``. Products the lexical route
+        never surfaced are appended, so the phrase route can only add recall.
+        Returns ``(ranked, confidence, leader)`` where confidence is the
+        winning product's share of the total phrase evidence and leader is the
+        product that phrase evidence alone points at.
+        """
+        fp = self._fp_scores(st)
+        if not fp:
+            return ranked, 0.0, None
+        w = float(os.environ.get("C_FP_W", "12.0"))
+        pw = float(os.environ.get("C_FP_POPW", "1.0"))
+        # Evidence arrives on an absolute IDF scale. REF is the IDF of a
+        # phrase carried by roughly 1 in 400 products -- the point at which a
+        # single matched phrase is specific enough to be worth trusting.
+        ref = float(os.environ.get("C_FP_REF", "6.0"))
+        raw = max(fp.values())
+        top = min(1.0, raw / ref)
+        ordered = sorted(fp.values(), reverse=True)
+        gap = (raw - ordered[1]) / raw if len(ordered) > 1 and raw > 0 else 1.0
+        conf = top * (0.5 + 0.5 * gap)
+        fp = {a: v / ref for a, v in fp.items()}
+        # Lexical weight fades as phrase evidence firms up, and the
+        # popularity prior fades in behind it, so the two never fight: BM25
+        # leads an open-ended turn, exact phrases lead a constrained one.
+        lex_w = 1.0 - min(conf, 0.9)
+        pop = self.iindex.pop
+        norm = ranked[0][0] if ranked and ranked[0][0] > 0 else 1.0
+        # The phrase route re-ranks the lexical candidate pool; it never
+        # injects a product the lexical routes did not surface. That bounds
+        # its blast radius: a wrong phrase match can cost rank, never recall.
+        blended = [(lex_w * (s / norm) + w * fp.get(a, 0.0)
+                    + pw * conf * pop.get(a, 0.0), a) for s, a in ranked]
+        blended.sort(key=lambda x: (-x[0], x[1]))
+        return blended, conf, blended[0][1] if blended else None
 
     def _query(self, st) -> dict[str, float]:
         q: dict[str, float] = defaultdict(float)
@@ -426,13 +480,11 @@ class Agent:
                 st["shown"] = set()
         if not self._is_noninformative(user_message):
             st["turns"].append((turn, user_message))
+        self._fp_observe(st, user_message, turn)
         if not st["cat"]:
             c = self._extract_category(user_message)
             if c:
                 st["cat"] = c
-        if turn == 1:
-            st["track"] = self._classify_track(user_message)
-
         raw = self.bm25.score(self._query(st))
         catset = set(st["cat"])
         use_profile = turn <= 2 and _flag("C_PROFILE", "1")
@@ -481,62 +533,35 @@ class Agent:
                            for s, a in head), key=lambda x: (-x[0], x[1]))
             ranked = head + tail
 
-        exclude = st.get("shown", set()) if early_rotate != "0" else set()
+        ranked, fp_conf, leader = self._fp_blend(st, ranked)
+        locked = fp_conf >= float(os.environ.get("C_FP_TAU", "0.35"))
+        shown = st.get("shown", set()) if early_rotate != "0" else set()
+        # A locked-on product is exempt from shown-exclusion so the agent can
+        # keep re-asserting its single best answer (an intent_override is not
+        # scorable until the override turn). Everything else the customer has
+        # already passed over still gets rotated out.
+        exclude = (shown - {leader}) if locked else shown
         avail = [(s, a) for s, a in ranked if a not in exclude] or ranked
         top = avail[:50]
 
-        explorer_turn = (turn <= 2 and _flag("C_TRACK", "0")
-                         and st.get("track") == "explorer")
-        if explorer_turn:
-            recs = self._diverse_slate([a for _, a in top], 3)
-            attr, msg = self._ask_category(recs)
-        else:
-            n = self._gate_count([s for s, _ in top[:10]], turn)
-            recs = [a for _, a in top[:n]]
-            cands = [(a, s) for s, a in top[:30]]
+        n = self._gate_count([s for s, _ in top[:10]], turn)
+        if locked:
+            n = _locked_slate(n)
+        recs = [a for _, a in top[:n]]
+        cands = [(a, s) for s, a in top[:30]]
 
-            if self.question_policy == "infogain":
-                attr, msg = self._ask_infogain(st, cands)
-            elif self.question_policy == "hybrid":
-                attr, msg = self._ask_hybrid(st, cands)
-            elif self.question_policy == "none":
-                attr, msg = None, "Here are the closest matches I found."
-            else:
-                attr, msg = self._ask_open()
+        if self.question_policy == "infogain":
+            attr, msg = self._ask_infogain(st, cands)
+        elif self.question_policy == "hybrid":
+            attr, msg = self._ask_hybrid(st, cands)
+        elif self.question_policy == "none":
+            attr, msg = None, "Here are the closest matches I found."
+        else:
+            attr, msg = self._ask_open()
 
         return {"message": msg, "ask_attribute": attr,
                 "recommendations": [{"parent_asin": a} for a in recs],
                 "usage": {"prompt_tokens": 0, "completion_tokens": 0}}
-
-    def _diverse_slate(self, ranked_asins: list[str], k: int) -> list[str]:
-        seen_cats: set[str] = set()
-        slate: list[str] = []
-        for a in ranked_asins:
-            c = self.coarse_cat.get(a, "")
-            if c in seen_cats:
-                continue
-            seen_cats.add(c)
-            slate.append(a)
-            if len(slate) == k:
-                break
-        if len(slate) < k:
-            for a in ranked_asins:
-                if a in slate:
-                    continue
-                slate.append(a)
-                if len(slate) == k:
-                    break
-        return slate
-
-    def _ask_category(self, asins: list[str]):
-        cats = []
-        for a in asins:
-            c = self.coarse_cat.get(a, "")
-            if c and c not in cats:
-                cats.append(c)
-        if not cats:
-            return self._ask_open()
-        return "category", "Which of these are you interested in: " + ", ".join(cats) + "?"
 
 
 _PRICE = r"\$?\s*(\d+(?:\.\d{1,2})?)"
@@ -564,6 +589,17 @@ SLATE_SIZE = 10
 
 def _expand(term: str) -> set[str]:
     return {term} | EXPAND.get(term, set())
+
+
+def _locked_slate(gated: int) -> int:
+    """Slate size once the phrase route has locked onto a product.
+
+    MRR is scored at the *first* turn the target appears, so widening the
+    slate converts earlier but at a worse rank. ``C_FP_SLATE=gate`` keeps the
+    normal width (convert only at rank 1); an integer widens to that many.
+    """
+    mode = os.environ.get("C_FP_SLATE", "gate")
+    return gated if mode == "gate" else max(gated, int(mode))
 
 
 def _flag(name: str, default: str = "1") -> bool:
@@ -801,55 +837,6 @@ class ShoppingCopilot(Agent):
                     fused[a] *= 0.93 ** min(flags, 3)
         return sorted(fused.items(), key=lambda x: (-x[1], x[0])), raw1
 
-    def _maybe_rerank(self, st, ranked):
-        if os.environ.get("RERANKER") != "ce" or len(ranked) < 2:
-            return ranked
-        try:
-            from sentence_transformers import CrossEncoder  # type: ignore
-            if not hasattr(self, "_ce"):
-                self._ce = CrossEncoder(os.environ.get(
-                    "CE_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2"))
-        except Exception:
-            return ranked
-        query = " ".join(t for _, t in st["turns"][-3:])[:512]
-        head = ranked[:40]
-        scores = self._ce.predict([(query, self.blob[a][:512]) for a, _ in head])
-        head = [ab for _, ab in sorted(zip([-s for s in scores], head))]
-        return head + ranked[40:]
-
-    def _state_score(self, st, asin: str) -> float:
-        score = 0.0
-        for t, _bucket, vals in st["constraints"]:
-            recency = 1.0 + 0.3 * (t - 1)
-            for v in vals:
-                for term in _expand(v):
-                    if asin in self.term_asins.get(term, ()):
-                        idf = self.bm25.idf.get(term, 0.0)
-                        score += recency * (idf if idf > 0 else 0.1)
-        bad = st["bad_values"]
-        if bad:
-            penalty = sum(bad.get((attr, val), 0)
-                          for attr, val in self._attrs(asin).items())
-            if penalty:
-                score -= 0.5 * penalty
-        return score
-
-    def _state_rerank(self, st, ranked, turn: int):
-        if not _flag("C_RERANK", "0") or turn < 3 or len(ranked) < 2:
-            return ranked
-        top10 = ranked[:10]
-        rest = ranked[10:]
-        top_score = top10[0][1]
-        if top_score <= 0:
-            return ranked
-        second_score = top10[1][1] if len(top10) > 1 else 0.0
-        margin = (top_score - second_score) / top_score
-        margin_thresh = float(os.environ.get("C_RERANK_MARGIN", "0.15"))
-        if margin >= margin_thresh:
-            return ranked
-        rescored = sorted(top10, key=lambda x: (-self._state_score(st, x[0]), -x[1]))
-        return rescored + rest
-
     def _learn_from_rejection(self, st):
         slate = st["last_slate"]
         if not slate:
@@ -878,6 +865,7 @@ class ShoppingCopilot(Agent):
             st["last_slate"] = []
             st["asked"] = set()
 
+        self._fp_observe(st, user_message, turn)
         rescue_at = int(os.environ.get("C_RESCUE_TURN", "4"))
         if turn < rescue_at:
             out = super().respond(session_id, user_message, turn, top_k)
@@ -906,19 +894,23 @@ class ShoppingCopilot(Agent):
 
         allowed, soft = self._allowed_set(st)
         ranked, raw1 = self._fuse(st, allowed, soft)
-        ranked = self._maybe_rerank(st, ranked)
-        ranked = self._state_rerank(st, ranked, turn)
         if turn <= 2 and _flag("C_PROFILE", "1"):
             ranked = sorted(
                 ((a, s * (1.0 + self._profile_prior(st, a))) for a, s in ranked),
                 key=lambda x: (-x[1], x[0]))
 
+        blended, fp_conf, leader = self._fp_blend(st, [(s, a) for a, s in ranked])
+        ranked = [(a, s) for s, a in blended]
+        locked = fp_conf >= float(os.environ.get("C_FP_TAU", "0.35"))
+
         k = min(SLATE_SIZE, top_k or SLATE_SIZE)
-        exclude = st["shown"] if _flag("C_ROTATE") else set()
+        shown = st["shown"] if _flag("C_ROTATE") else set()
+        exclude = (shown - {leader}) if locked else shown
         avail = [(a, s) for a, s in ranked if a not in exclude]
         gate_scores = sorted((raw1.get(a, 0.0) for a, _ in avail[:10]),
                              reverse=True)
-        k = min(k, self._gate_count(gate_scores, turn))
+        gated = self._gate_count(gate_scores, turn)
+        k = min(k, _locked_slate(gated) if locked else gated)
         slate = [a for a, _ in avail][:k]
         if len(slate) < k:
             for a in sorted(allowed - st["shown"] - set(slate),

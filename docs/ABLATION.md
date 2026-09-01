@@ -7,26 +7,35 @@ This document is the technical record behind `starter/agent.py`'s configuration.
 | | hit_rate_at_10 | mrr | mttc | efficiency | recommended_technical_score |
 |---|---|---|---|---|---|
 | **Baseline** (provided weak BM25 starter, `docs/baseline_results.json`) | 0.125 | 0.068034 | 9.81 | 0.119 | **0.10671** |
-| **Final** (robustness hardening + `C_PROFILE` on) | 0.980 | 0.819492 | 2.965 | 0.8035 | **0.896548** |
+| Lexical + semantic pipeline (`C_FP=0`) | 0.980 | 0.822500 | 2.965 | 0.8035 | 0.897458 |
+| **Final** (+ catalog attribute-phrase reranking) | **0.995** | **0.864692** | **2.805** | **0.8195** | **0.920808** |
 
-**8.4x improvement** (0.896548 / 0.10671 = 8.402).
+**8.63x improvement** over the provided baseline (0.920808 / 0.10671 = 8.629).
 
-Per-scenario hit rates, final configuration:
+Per-scenario metrics, final configuration:
 
-| scenario | n | hit_rate_at_10 |
-|---|---|---|
-| boundary | 10 | 0.900 |
-| browsing | 80 | 0.975 |
-| buying | 80 | 1.000 |
-| intent_override | 30 | 0.966667 |
+| scenario | n | hit@10 | mrr | mttc | mrr before | mttc before |
+|---|---|---|---|---|---|---|
+| buying | 80 | 1.000 | 0.900 | 2.225 | 0.877 | 2.46 |
+| browsing | 80 | 0.9875 | 0.837 | 2.800 | 0.847 | 2.84 |
+| intent_override | 30 | 1.000 | 0.814 | 4.167 | 0.653 | 4.37 |
+| boundary | 10 | 1.000 | 0.950 | 3.400 | 0.695 | 3.80 |
 
-The organizer-provided baseline result (`docs/baseline_results.json`) reports only the four aggregate metrics above, not a per-scenario breakdown, and the weak-BM25 starter code itself isn't present in this repository to regenerate one — so no baseline per-scenario row is given rather than an invented one.
+`intent_override` and `boundary` sessions cannot converge on turn 1 by
+construction — an override is only scorable from the turn it lands on, and a
+boundary session spends one turn declining to answer.
 
 ## 2. Leave-one-out ablation
 
 For each configuration variable below, we reverted *only that one setting* to its non-default alternative and re-ran the full 200-sample evaluation. These historical rows share the same pre-robustness stack, so their deltas are internally comparable to one another; they are not deltas against the current `C_ROBUST=1` baseline.
 
 | rank | variable reverted to | score | Δ vs. current default |
+|---|---|---|---|
+| 0 | `C_FP=0` (disable the attribute-phrase reranking route) | 0.897458 | **−0.023350** |
+
+Rows 1 onward are *historical*: measured under the pre-phrase-route stack.
+
+| rank | variable reverted to | score | Δ vs. the then-current default |
 |---|---|---|---|
 | 1 | `GATE=off` (disables turn-based slate gating entirely) | 0.851337 | **−0.047490** |
 | 2 | `C_ROTATE=0` (stop excluding shown products, turn ≥ `C_RESCUE_TURN`) | 0.868355 | **−0.030472** |
@@ -106,6 +115,40 @@ Two mechanisms were built, measured, and are shipped **without becoming the defa
 - **`C_PENALTY`** (bad-value ranking penalty in `_fuse`): measured at **+0.0013** against today's stack. This is a different case from `C_RERANK`: `C_PENALTY` has always defaulted to *on* (via `_flag`'s own generic default, not a decision made in this investigation), and its small positive contribution means there's no case for turning it off — it simply isn't a lever we invested further tuning in, since its effect is small enough that further work on it wasn't prioritized over the larger levers in §2. It is not "shipped disabled"; it is shipped on, as it already was, with a now-quantified small contribution.
 
 Both fall below the +0.005 significance bar (§4); neither is hidden.
+
+### 3.8 Exact attribute phrases beat bag-of-words over the same text
+
+BM25 over `features`/`details` treats those fields as a bag of words, so
+"Machine Wash" scores the same as a document containing "machine" and "wash"
+far apart. Shoppers often state a requirement using the whole attribute value
+as the listing writes it. `starter/intent_index.py` indexes every `features`
+bullet and every `details` value a listing carries, verbatim, plus the facet
+words held under material/fabric/colour keys, and matches stated phrases
+against that index on an absolute IDF scale — one rare bullet outweighs one
+common one — with a soft category-token-overlap bonus that is never a filter.
+
+Two design constraints keep it safe:
+
+* **Reranking only.** The route reorders the lexical candidate pool and never
+  injects a product BM25/LSA did not surface. A wrong phrase match can cost
+  rank; it cannot cost recall. Removing this bound was measured: an
+  unrestricted version scored **0.879667**, *below* the 0.897458 lexical-only
+  baseline, because a confident lock on a common phrase burns turns.
+* **Ties broken by review volume.** Exactly-equal phrase evidence in a clothing
+  catalog means near-duplicate listings (colourway or size variants). Nothing
+  textual separates them; purchase volume does.
+
+Measured contribution: **+0.023350** (0.897458 → 0.920808), hit@10 0.980 →
+0.995, MRR 0.8225 → 0.8647, MTTC 2.965 → 2.805.
+
+**Scope note.** An earlier iteration of this module reconstructed, per catalog
+product, the exact structure the local simulator generates from it — synthetic
+phrases the catalog never contains, a fixed 2-hard/2-soft slot split, a
+positional bonus keyed to that order, and a copy of the evaluator's own
+category helper. It scored 0.9658 and was removed: it inverted the evaluation
+harness rather than doing retrieval, and a score obtained that way does not
+describe the system's behaviour on any real catalog. Everything in the shipped
+module is a function of the read-only catalog alone.
 
 ### 3.6 Paraphrase robustness
 

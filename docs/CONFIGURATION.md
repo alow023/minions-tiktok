@@ -6,10 +6,15 @@ variables, each with a hardcoded default chosen from measurement on the
 200-sample public set (`data/public_set.jsonl`).
 
 **With no environment variables set, the current defaults reproduce
-`recommended_technical_score = 0.896548`** (`hit_rate_at_10 = 0.980`,
-`mrr = 0.819492`, `mttc = 2.965`) — verified with
-`env -i python3 -m evaluator.local_evaluator` in a fully scrubbed
-environment.
+`recommended_technical_score = 0.920808`** (`hit_rate_at_10 = 0.995`,
+`mrr = 0.864692`, `mttc = 2.805`, `efficiency = 0.8195`) — verified with
+`env -i python3 -m evaluator.local_evaluator` in a fully scrubbed environment,
+with `scikit-learn` installed. Without it the semantic route degrades out and
+the agent still runs on the standard library alone.
+
+Measurements labelled *historical* below were taken under the pre-phrase-route
+stack (`C_FP=0`, score `0.897458`) and are kept because they explain why each
+setting is where it is; they are not deltas against the current default.
 
 The measurements below that predate the robustness defaults are retained as
 historical ablations; their numeric deltas are not comparisons against the
@@ -73,18 +78,53 @@ Weight applied to turns before an intent override when building the BM25 query i
 In `_fuse`, multiplies a candidate's score by `0.93 ** min(flags, 3)` for each attribute value it shares with entries in `st["bad_values"]` (values seen ≥2 times across rejected slates and not currently stated). Set to `"0"` to disable.
 **Measured**: `C_PENALTY=0` → 0.897527 (Δ **−0.001300**). Small effect under the current stack; a much earlier measurement (under a different default stack, before several other changes) found this completely inert (bit-identical with and without it) because `bad_values` rarely reached the required threshold before a session resolved. It now has a small but real effect.
 
-## Reranking
+## Attribute-phrase reranking route
 
-### `C_RERANK` — default `"0"` (off, documented negative result)
-When on, reranks the top-10 candidates for turns ≥3 using accumulated session state (recency-weighted constraint match with an IDF bonus for rare tokens, and a penalty for sharing attributes with refuted products) instead of the raw query — but only when the leading candidate's score margin over the runner-up is below `C_RERANK_MARGIN`, so a session already converging cleanly at rank 1 is left untouched.
-**Measured**: `C_RERANK=1` with `C_RERANK_MARGIN=0.05` → 0.899364 (Δ **+0.000537** under today's full stack — even smaller than the +0.0015 measured when this was first introduced, before `C_ROTATE_EARLY` existed and closed some of the same rank-promotion opportunity). Well under the +0.005 bar in both measurements. There was also a real regression found at introduction time: `public_0187`, a `boundary` session already hitting cleanly at rank 1, got demoted to rank 2 because the margin guard fired on a session that didn't need help. Kept behind the flag as a documented negative result rather than deleted — the mechanism is sound and available for further tuning, but doesn't currently clear the bar.
+Implemented in `starter/intent_index.py`, fused in `Agent._fp_blend`. See
+`docs/ABLATION.md` §3.8 for the mechanism and the measurement.
 
-### `C_RERANK_MARGIN` — default `"0.15"`
-Only active when `C_RERANK=1`. The score-margin threshold below which `_state_rerank` will reorder the top 10; a larger value reranks more readily (a less clear leader still gets reranked), a smaller value only reranks the most ambiguous cases.
-**Measured** (swept at `C_RERANK=1`, under the stack in place when `C_RERANK` was introduced): 0.05 → peak; 0.10 through 1.0 → plateau at a slightly lower score. Loosening the guard past ~0.10 stops changing which sessions get reranked.
+### `C_FP` — default `"1"` (on)
+Master switch. `"0"` disables the route entirely and the agent falls back to
+the lexical + semantic pipeline.
+**Measured**: `C_FP=0` → 0.897458 (Δ **−0.023350**); hit@10 0.995 → 0.980,
+MRR 0.8647 → 0.8225, MTTC 2.805 → 2.965.
 
-### `RERANKER` — default unset (off)
-Independent of `C_RERANK`. When set to `"ce"`, `_maybe_rerank` reranks the top-40 candidates with a `sentence_transformers` cross-encoder (model configurable via `CE_MODEL`, default `cross-encoder/ms-marco-MiniLM-L-6-v2`), imported lazily at call time; any import failure silently falls back to the unreranked order. **Not measured in this investigation, not used for the reported score, and not a dependency of `requirements.txt`** — install `sentence-transformers` separately if you want to experiment with it.
+### `C_FP_W` — default `"12.0"`
+Weight on phrase evidence when fused with the max-normalised lexical score.
+
+### `C_FP_REF` — default `"6.0"`
+IDF reference scale: roughly the IDF of a phrase carried by 1 in 400 products,
+i.e. the point at which a single matched phrase is specific enough to trust.
+Evidence is divided by this before blending, so confidence tracks phrase
+*rarity* rather than the share of stated phrases matched. Normalising by the
+stated total instead (so one common phrase looks as confident as one rare one)
+was measured at **0.884550**, below the lexical-only baseline.
+
+### `C_FP_POPW` — default `"1.0"`
+Weight on the review-volume prior that orders candidates with exactly equal
+phrase evidence, scaled by the route's own confidence so it is inert while
+evidence is thin.
+
+### `C_FP_CATBONUS` — default `"1.0"`
+Multiplicative bonus proportional to category-token overlap. Never a hard
+filter, so a mis-parsed category cannot drop the true product.
+
+### `C_FP_TAU` — default `"0.35"`
+Confidence at which the route is considered *locked*: above it, the current
+leading product is exempt from shown-exclusion, so a product identified before
+a customer's override lands is still there when the override makes it
+scorable. The exemption is scoped to the leader only — exempting the whole
+shown-set re-shows declined products deeper in later slates.
+
+### `C_FP_SLATE` — default `"gate"`
+Slate width once the route has locked. `"gate"` keeps the normal `G_CAPS`
+width; an integer widens it. Widening converts sooner but at a worse rank, and
+MRR outweighs efficiency roughly 7:1 in the scoring formula.
+
+### `C_FP_PREOVW` — default `"0.5"`
+Weight on phrases stated *before* an intent override. An override rewrites a
+preference, not the shopping mission, so earlier phrases stay as
+weaker-but-real evidence rather than being discarded.
 
 ## User profile
 

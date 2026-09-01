@@ -1,5 +1,6 @@
 __pycache__/
 *.py[cod]
+.pytest_cache/
 .DS_Store
 .env
 results.json
@@ -16,3 +17,6 @@ docs/participant_release_checklist.md
 tests/test_5core_builder.py
 tests/test_organizer_pipeline.py
 *.log
+
+# Dead code staged for manual deletion (see dev/README.md)
+_to_delete/
