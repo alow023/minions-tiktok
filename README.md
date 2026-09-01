@@ -138,6 +138,16 @@ docs/challenge_readme.md  the organizer's original README (challenge rules and A
   Clothing/Shoes/Jewelry products) and `data/public_set.jsonl` (200 labeled
   sessions), both read-only and unmodified. See `DATA_ATTRIBUTION.md`.
 
+## Team contributions
+
+| Team member | Contributions                                                                                                                                                                                      |
+| ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Claire**  | Developed the semantic retrieval component using TF-IDF, Latent Semantic Analysis, and cosine-similarity reranking. Helped integrate the semantic route with the existing BM25 candidate pipeline. |
+| **Xiaomei** | Developed the dialogue-state and intent-routing logic, including buyer-versus-explorer classification, constraint extraction, preference overrides, and adaptive clarification questions.          |
+| **Arissa**  | Developed the multi-route ranking and evaluation pipeline, including Reciprocal Rank Fusion, confidence gating, candidate rotation, metric analysis, and configuration tuning.                     |
+
+All three members contributed to solution design, debugging, evaluator testing, performance comparison, documentation, and preparation of the final presentation.
+
 ## Limitations and what we would improve
 
 - **Phrase-route coverage depends on catalog metadata quality.** Products with
